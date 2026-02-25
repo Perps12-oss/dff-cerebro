@@ -1,13 +1,18 @@
-# cerebro/ui/pages/__init__.py
+# cerebro/ui/__init__.py
 """
-UI Pages package exports.
+CEREBRO UI Package
+"""
 
-Keep exports stable for backward compatibility.
-"""
-from .start_page import StartPage, StartScanConfig  # noqa: F401
-from .scan_page import ScanPage  # noqa: F401
-from .review_page import ReviewPage  # noqa: F401
-from .history_page import HistoryPage  # noqa: F401
-from .theme_page import ThemePage  # noqa: F401
-from .settings_page import SettingsPage  # noqa: F401
-from .audit_page import AuditPage  # noqa: F401
+# Import the new theme system components instead of the old ones
+from .theme_engine import ThemeManager, ThemeMixin
+
+# Keep the existing imports for other components
+from .main_window import MainWindow
+
+
+__all__ = [
+    'ThemeManager',
+    'ThemeMixin',
+    'MainWindow',
+    'create_main_window',
+]
