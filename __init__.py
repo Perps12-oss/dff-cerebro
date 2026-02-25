@@ -1,18 +1,16 @@
-# cerebro/ui/__init__.py
+# path: cerebro/services/__init__.py
 """
-CEREBRO UI Package
+Service layer components.
 """
 
-# Import the new theme system components instead of the old ones
-from .theme_engine import ThemeManager, ThemeMixin
-
-# Keep the existing imports for other components
-from .main_window import MainWindow
-
+from .logger import logger, set_scan_id, get_scan_id, flush_all_handlers
+from .startup_assertions import StartupAssertions, StartupHealth
 
 __all__ = [
-    'ThemeManager',
-    'ThemeMixin',
-    'MainWindow',
-    'create_main_window',
+    'LoggerEngine',
+    'set_scan_id',
+    'get_scan_id',
+    'flush_all_handlers',
+    'StartupAssertions',
+    'StartupHealth',
 ]

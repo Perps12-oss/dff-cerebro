@@ -1,537 +1,334 @@
-# cerebro/history/store.py
+"""
+CEREBRO History Store - Target Architecture (Authoritative)
+Records deletion audit trail (append-only JSONL) with query helpers.
+
+Storage:
+~/.cerebro/history/audit/deletions_YYYY-MM-DD.jsonl
+
+Persistence: atomic write (temp → fsync → rename), schema_version, skip corrupt lines with single warning.
+"""
+
 from __future__ import annotations
 
-import gzip
 import json
 import os
-import shutil
-import sys
-import time
-import uuid
-import csv
-import io
-from contextlib import contextmanager
-from dataclasses import asdict
-from datetime import datetime, timezone
+import tempfile
+from dataclasses import dataclass, asdict
+from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple, Callable
+from typing import Any, Callable, Dict, List, Optional
 
-from .models import (
-    HISTORY_SCHEMA_VERSION,
-    PAYLOAD_SCHEMA_VERSION,
-    ScanHistoryEntry,
-    ScanResultSummary,
-    ScanStatus,
-    ScanWarningsSummary,
-    ScanHealthSnapshot,
-)
+SCHEMA_VERSION = 1
 
 
-def _utc_now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+@dataclass
+class ResumePayload:
+    """Payload for resuming a scan from checkpoint (scan_id, config, inventory_db_path, checkpoint_path, timestamp)."""
+    scan_id: str
+    config: Dict[str, Any]
+    inventory_db_path: str
+    checkpoint_path: str
+    timestamp: float
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "scan_id": self.scan_id,
+            "config": self.config,
+            "inventory_db_path": self.inventory_db_path,
+            "checkpoint_path": self.checkpoint_path,
+            "timestamp": self.timestamp,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "ResumePayload":
+        return cls(
+            scan_id=str(data.get("scan_id", "")),
+            config=dict(data.get("config", {}) or {}),
+            inventory_db_path=str(data.get("inventory_db_path", "")),
+            checkpoint_path=str(data.get("checkpoint_path", "")),
+            timestamp=float(data.get("timestamp", 0) or 0),
+        )
 
 
-def _safe_mkdir(p: Path) -> None:
-    p.mkdir(parents=True, exist_ok=True)
+def _migrate_record(data: Dict[str, Any]) -> Dict[str, Any]:
+    """Stub for future schema migrations. Returns data suitable for from_dict."""
+    version = data.get("schema_version", 0)
+    if version < SCHEMA_VERSION:
+        data = dict(data)
+        data["schema_version"] = SCHEMA_VERSION
+    return data
 
 
-def _atomic_write_text(path: Path, text: str, encoding: str = "utf-8") -> None:
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp.write_text(text, encoding=encoding)
-    os.replace(tmp, path)
+@dataclass
+class DeletionAuditRecord:
+    """
+    Audit record for deletion operations.
+    Who/what/why/when for full traceability.
+    """
+    scan_id: str
+    timestamp: float
+    mode: str  # 'trash' or 'permanent'
+    groups: int
+    deleted: int
+    failed: int
+    bytes_reclaimed: int
+    source: str  # 'review_page', 'auto_cleanup', etc.
+    policy: Dict[str, Any]
+    details: List[Dict[str, Any]]  # per-file details
 
+    def to_dict(self) -> Dict[str, Any]:
+        d = asdict(self)
+        d["schema_version"] = SCHEMA_VERSION
+        return d
 
-def _atomic_write_bytes(path: Path, data: bytes) -> None:
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp.write_bytes(data)
-    os.replace(tmp, path)
-
-
-@contextmanager
-def _file_lock(lock_path: Path, timeout_s: float = 5.0, poll_s: float = 0.05):
-    lock_path.parent.mkdir(parents=True, exist_ok=True)
-    start = time.time()
-    fp = None
-    try:
-        fp = open(lock_path, "a+b")
-        locked = False
-        while time.time() - start <= timeout_s:
-            try:
-                if os.name == "nt":
-                    import msvcrt
-                    msvcrt.locking(fp.fileno(), msvcrt.LK_NBLCK, 1)
-                else:
-                    import fcntl
-                    fcntl.flock(fp.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-                locked = True
-                break
-            except Exception:
-                time.sleep(poll_s)
-        if not locked:
-            raise TimeoutError(f"Could not acquire lock: {lock_path}")
-        yield
-    finally:
-        if fp:
-            try:
-                if os.name == "nt":
-                    import msvcrt
-                    msvcrt.locking(fp.fileno(), msvcrt.LK_UNLCK, 1)
-                else:
-                    import fcntl
-                    fcntl.flock(fp.fileno(), fcntl.LOCK_UN)
-            except Exception:
-                pass
-            try:
-                fp.close()
-            except Exception:
-                pass
-
-
-def default_app_data_dir(app_name: str = "CEREBRO") -> Path:
-    home = Path.home()
-    if os.name == "nt":
-        base = Path(os.environ.get("APPDATA", str(home / "AppData" / "Roaming")))
-    elif sys.platform == "darwin":
-        base = home / "Library" / "Application Support"
-    else:
-        base = Path(os.environ.get("XDG_DATA_HOME", str(home / ".local" / "share")))
-    return base / app_name
-
-
-def to_jsonable(obj: Any) -> Any:
-    from dataclasses import is_dataclass
-    from enum import Enum
-    from pathlib import Path as _Path
-    from datetime import datetime as _dt
-
-    if obj is None:
-        return None
-    if isinstance(obj, (bool, int, float, str)):
-        return obj
-    if isinstance(obj, Enum):
-        return obj.value
-    if isinstance(obj, _Path):
-        return str(obj)
-    if isinstance(obj, _dt):
-        return obj.isoformat()
-    if isinstance(obj, (list, tuple)):
-        return [to_jsonable(x) for x in obj]
-    if isinstance(obj, dict):
-        return {str(k): to_jsonable(v) for k, v in obj.items()}
-    if is_dataclass(obj):
-        return to_jsonable(asdict(obj))
-    if hasattr(obj, "__dict__"):
-        return to_jsonable(vars(obj))
-    return str(obj)
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "DeletionAuditRecord":
+        data = _migrate_record(data)
+        # Allow schema_version in dict but do not pass to dataclass
+        data = {k: v for k, v in data.items() if k != "schema_version"}
+        return cls(**data)
 
 
 class HistoryStore:
-    def __init__(self, base_dir: Optional[Path] = None, engine_version: str = ""):
-        self.base_dir = base_dir or (default_app_data_dir("CEREBRO") / "history")
-        self.engine_version = engine_version
+    """Stores and retrieves deletion history with full audit trail."""
 
-        self.index_path = self.base_dir / "history_index.json"
-        self.lock_path = self.base_dir / "history_index.lock"
-        self.payload_dir = self.base_dir / "payloads"
-        self.exports_dir = self.base_dir / "exports"
-        self.health_dir = self.base_dir / "health_logs"
+    def __init__(self, base_dir: Optional[Path] = None) -> None:
+        self._base_dir = base_dir or (Path.home() / ".cerebro" / "history")
+        self._audit_dir = self._base_dir / "audit"
+        self._resume_file = self._base_dir / "resume_payload.json"
+        self._ensure_dirs()
+        self._logger = None
+        try:
+            from ..services.logger import Logger  # type: ignore
+            self._logger = Logger()
+        except Exception:
+            self._logger = None
 
-        _safe_mkdir(self.base_dir)
-        _safe_mkdir(self.payload_dir)
-        _safe_mkdir(self.exports_dir)
-        _safe_mkdir(self.health_dir)
+    def _ensure_dirs(self) -> None:
+        self._audit_dir.mkdir(parents=True, exist_ok=True)
 
-        if not self.index_path.exists():
-            self._write_index({"schema_version": HISTORY_SCHEMA_VERSION, "entries": []})
+    def _log(self, message: str, level: str = "info") -> None:
+        if self._logger:
+            try:
+                getattr(self._logger, level, self._logger.info)(message)
+            except Exception:
+                pass
 
-    # -------------------------
-    # Core API (Compatible)
-    # -------------------------
-
-    def list_entries(self, tag_filter: Optional[str] = None) -> List[ScanHistoryEntry]:
-        idx = self._read_index()
-        entries = [ScanHistoryEntry.from_dict(d) for d in (idx.get("entries") or [])]
-        if tag_filter:
-            entries = [e for e in entries if tag_filter in e.tags]
-        entries.sort(key=lambda e: (not e.pinned, e.started_at_iso), reverse=True)
-        return entries
-
-    def get_entry(self, scan_id: str) -> Optional[ScanHistoryEntry]:
-        for e in self.list_entries():
-            if e.scan_id == scan_id:
-                return e
-        return None
-
-    def begin_scan(self, root_path: str, settings_snapshot: Dict[str, Any], 
-                   name: Optional[str] = None, tags: Optional[List[str]] = None,
-                   parent_scan_id: str = "") -> ScanHistoryEntry:
-        scan_id = str(uuid.uuid4())
-        started_at = _utc_now_iso()
-        payload_ref = f"payloads/{scan_id}.json.gz"
-        entry = ScanHistoryEntry(
-            scan_id=scan_id,
-            name=name or f"Scan {started_at}",
-            root_path=str(root_path),
-            status=ScanStatus.IN_PROGRESS,
-            started_at_iso=started_at,
-            finished_at_iso="",
-            duration_ms=0,
-            root_mtime=self._try_stat_mtime(root_path),
-            engine_version=self.engine_version,
-            history_schema_version=HISTORY_SCHEMA_VERSION,
-            payload_schema_version=PAYLOAD_SCHEMA_VERSION,
-            settings_snapshot=to_jsonable(settings_snapshot) or {},
-            result_summary=ScanResultSummary(),
-            warnings_summary=ScanWarningsSummary(),
-            payload_ref=payload_ref,
-            error_message="",
-            tags=tags or [],
-            pinned=False,
-            parent_scan_id=parent_scan_id,
-        )
-        self._upsert_entry(entry)
-        return entry
-
-    def complete_scan(
+    def record_deletion(
         self,
+        *,
         scan_id: str,
-        result_summary: ScanResultSummary,
-        payload: Any,
-        warnings_summary: Optional[ScanWarningsSummary] = None,
-        finished_at_iso: Optional[str] = None,
-        health_snapshots: Optional[List[ScanHealthSnapshot]] = None,
-    ) -> ScanHistoryEntry:
-        entry = self.get_entry(scan_id)
-        if not entry:
-            raise KeyError(f"Scan entry not found: {scan_id}")
+        mode: str,
+        groups: int,
+        deleted: int,
+        failed: int,
+        bytes_reclaimed: int,
+        source: str,
+        policy: Optional[Dict[str, Any]] = None,
+        details: Optional[List[Dict[str, Any]]] = None,
+    ) -> DeletionAuditRecord:
+        """Record a deletion operation to audit trail."""
+        record = DeletionAuditRecord(
+            scan_id=str(scan_id),
+            timestamp=datetime.now().timestamp(),
+            mode=str(mode),
+            groups=int(groups or 0),
+            deleted=int(deleted or 0),
+            failed=int(failed or 0),
+            bytes_reclaimed=int(bytes_reclaimed or 0),
+            source=str(source),
+            policy=dict(policy or {}),
+            details=list(details or []),
+        )
 
-        finished_at = finished_at_iso or _utc_now_iso()
-        entry.finished_at_iso = finished_at
-        entry.status = ScanStatus.COMPLETED
-        entry.error_message = ""
-        entry.result_summary = result_summary
-        entry.warnings_summary = warnings_summary or ScanWarningsSummary()
-        entry.duration_ms = self._duration_ms(entry.started_at_iso, entry.finished_at_iso)
-        entry.root_mtime = self._try_stat_mtime(entry.root_path)
-        
-        if health_snapshots:
-            entry.health_snapshots = health_snapshots
-            if health_snapshots:
-                entry.peak_memory_percent = max(h.memory_percent for h in health_snapshots)
-                entry.peak_cpu_percent = max(h.cpu_percent for h in health_snapshots)
+        date_str = datetime.now().strftime("%Y-%m-%d")
+        audit_file = self._audit_dir / f"deletions_{date_str}.jsonl"
 
-        self._write_payload(entry.scan_id, payload, entry)
-        self._upsert_entry(entry)
-        return entry
-
-    def fail_scan(self, scan_id: str, error_message: str, 
-                  status: ScanStatus = ScanStatus.FAILED) -> ScanHistoryEntry:
-        entry = self.get_entry(scan_id)
-        if not entry:
-            raise KeyError(f"Scan entry not found: {scan_id}")
-
-        entry.status = status
-        entry.error_message = str(error_message)
-        entry.finished_at_iso = _utc_now_iso()
-        entry.duration_ms = self._duration_ms(entry.started_at_iso, entry.finished_at_iso)
-        self._upsert_entry(entry)
-        return entry
-
-    def update_health_snapshot(self, scan_id: str, snapshot: ScanHealthSnapshot):
-        """Live update health data during scan (for Health Panel)."""
-        entry = self.get_entry(scan_id)
-        if entry and entry.status == ScanStatus.IN_PROGRESS:
-            entry.health_snapshots.append(snapshot)
-            # Update peak values
-            entry.peak_memory_percent = max(entry.peak_memory_percent, snapshot.memory_percent)
-            entry.peak_cpu_percent = max(entry.peak_cpu_percent, snapshot.cpu_percent)
-            self._upsert_entry(entry)
-
-    def rename_scan(self, scan_id: str, new_name: str) -> None:
-        entry = self.get_entry(scan_id)
-        if not entry:
-            return
-        entry.name = new_name.strip() or entry.name
-        self._upsert_entry(entry)
-
-    def set_pinned(self, scan_id: str, pinned: bool) -> None:
-        entry = self.get_entry(scan_id)
-        if not entry:
-            return
-        entry.pinned = bool(pinned)
-        self._upsert_entry(entry)
-
-    def set_color_code(self, scan_id: str, color: str) -> None:
-        entry = self.get_entry(scan_id)
-        if entry:
-            entry.color_code = color
-            self._upsert_entry(entry)
-
-    def add_tags(self, scan_id: str, tags: List[str]) -> None:
-        entry = self.get_entry(scan_id)
-        if entry:
-            entry.tags = list(set(entry.tags + tags))
-            self._upsert_entry(entry)
-
-    def delete_scan(self, scan_id: str, delete_payload: bool = True) -> None:
-        with _file_lock(self.lock_path):
-            idx = self._read_index_unlocked()
-            entries = idx.get("entries") or []
-            new_entries = [e for e in entries if str(e.get("scan_id")) != scan_id]
-            idx["entries"] = new_entries
-            self._write_index_unlocked(idx)
-
-        if delete_payload:
-            entry_payload = self.payload_dir / f"{scan_id}.json.gz"
-            if entry_payload.exists():
+        try:
+            line = json.dumps(record.to_dict(), default=str) + "\n"
+            fd, tmp_path = tempfile.mkstemp(prefix="cerebro_audit_", suffix=".jsonl", dir=str(self._audit_dir))
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    if audit_file.exists():
+                        with open(audit_file, "r", encoding="utf-8") as existing:
+                            f.write(existing.read())
+                    f.write(line)
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.replace(tmp_path, audit_file)
+            except Exception:
                 try:
-                    entry_payload.unlink()
+                    os.unlink(tmp_path)
                 except Exception:
                     pass
-            # Also delete health log
-            health_log = self.health_dir / f"{scan_id}.health.json"
-            if health_log.exists():
-                health_log.unlink()
+                raise
+            self._log(
+                f"Recorded deletion audit: scan={record.scan_id} deleted={record.deleted} failed={record.failed} bytes={record.bytes_reclaimed}"
+            )
+        except Exception as e:
+            self._log(f"Failed to write audit record: {e}", level="warning")
 
-    def load_payload(self, scan_id: str) -> Dict[str, Any]:
-        payload_path = self.payload_dir / f"{scan_id}.json.gz"
-        if not payload_path.exists():
-            raise FileNotFoundError(f"Missing payload: {payload_path}")
-        with gzip.open(payload_path, "rt", encoding="utf-8") as f:
-            return json.load(f)
+        return record
 
-    def staleness_state(self, entry: ScanHistoryEntry) -> Tuple[str, str]:
-        root = Path(entry.root_path)
-        if not root.exists():
-            return ("invalid", "Root folder not found.")
-        try:
-            now_mtime = root.stat().st_mtime
-        except Exception:
-            return ("stale", "Cannot stat folder; may be stale.")
-        if entry.root_mtime <= 0:
-            return ("stale", "No baseline timestamp; may be stale.")
-        if now_mtime > entry.root_mtime + 1.0:
-            return ("stale", "Folder changed since scan; results may be stale.")
-        return ("fresh", "Likely unchanged since scan.")
+    def get_deletion_history(
+        self,
+        *,
+        scan_id: Optional[str] = None,
+        source: Optional[str] = None,
+        since: Optional[float] = None,
+        limit: int = 100,
+    ) -> List[DeletionAuditRecord]:
+        """Query deletion history with filters. Skips corrupt lines; logs one warning per run."""
+        records: List[DeletionAuditRecord] = []
+        files = sorted(self._audit_dir.glob("deletions_*.jsonl"), reverse=True)
+        _corrupt_warned: bool = False
 
-    # -------------------------
-    # New: Export & Comparison
-    # -------------------------
+        for audit_file in files:
+            try:
+                with open(audit_file, "r", encoding="utf-8") as f:
+                    for raw_line in f:
+                        line = raw_line.strip()
+                        if not line:
+                            continue
+                        try:
+                            data = json.loads(line)
+                            data = _migrate_record(data)
+                            if scan_id and data.get("scan_id") != scan_id:
+                                continue
+                            if source and data.get("source") != source:
+                                continue
+                            if since and float(data.get("timestamp", 0) or 0) < float(since):
+                                continue
+                            records.append(DeletionAuditRecord.from_dict(data))
+                            if len(records) >= limit:
+                                break
+                        except Exception:
+                            if not _corrupt_warned:
+                                self._log("History: skipping corrupt line in audit file", level="warning")
+                                _corrupt_warned = True
+                            continue
+            except Exception:
+                continue
 
-    def export_to_csv(self, scan_id: str, output_path: Optional[Path] = None) -> Path:
-        """Export scan results to CSV for external analysis."""
-        entry = self.get_entry(scan_id)
-        if not entry:
-            raise ValueError(f"Scan not found: {scan_id}")
-        
-        payload = self.load_payload(scan_id)
-        groups = payload.get("payload", {}).get("groups", [])
-        
-        if output_path is None:
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            output_path = self.exports_dir / f"scan_{scan_id}_{timestamp}.csv"
-        
-        with open(output_path, 'w', newline='', encoding='utf-8') as f:
+            if len(records) >= limit:
+                break
+
+        return records
+
+    def get_deletion_stats(self, *, days: int = 30) -> Dict[str, Any]:
+        """Aggregate deletion statistics over last N days."""
+        since = datetime.now().timestamp() - (int(days) * 24 * 60 * 60)
+        records = self.get_deletion_history(since=since, limit=10000)
+
+        total_deleted = sum(r.deleted for r in records)
+        total_failed = sum(r.failed for r in records)
+        total_bytes = sum(r.bytes_reclaimed for r in records)
+
+        by_mode: Dict[str, int] = {}
+        by_source: Dict[str, int] = {}
+
+        for r in records:
+            by_mode[r.mode] = by_mode.get(r.mode, 0) + r.deleted
+            by_source[r.source] = by_source.get(r.source, 0) + r.deleted
+
+        return {
+            "period_days": int(days),
+            "total_operations": len(records),
+            "total_deleted": total_deleted,
+            "total_failed": total_failed,
+            "total_bytes_reclaimed": total_bytes,
+            "by_mode": by_mode,
+            "by_source": by_source,
+            "average_files_per_operation": (total_deleted / len(records)) if records else 0.0,
+        }
+
+    def export_to_json(
+        self,
+        file_path: Path,
+        *,
+        limit: int = 10000,
+        progress_cb: Optional[Callable[[int, int], None]] = None,
+    ) -> None:
+        """Export deletion history to a JSON file. progress_cb(current, total) if provided."""
+        records = self.get_deletion_history(limit=limit)
+        total = len(records)
+        data = [r.to_dict() for r in records]
+        if progress_cb:
+            progress_cb(total, total)
+        with open(file_path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, default=str)
+            f.flush()
+            os.fsync(f.fileno())
+
+    def export_to_csv(
+        self,
+        file_path: Path,
+        *,
+        limit: int = 10000,
+        progress_cb: Optional[Callable[[int, int], None]] = None,
+    ) -> None:
+        """Export deletion history to CSV. progress_cb(current, total) if provided."""
+        import csv
+        records = self.get_deletion_history(limit=limit)
+        total = len(records)
+        if progress_cb:
+            progress_cb(0, total)
+        with open(file_path, "w", encoding="utf-8", newline="") as f:
             writer = csv.writer(f)
-            writer.writerow(['Group ID', 'File Path', 'Size (Bytes)', 'Hash', 'Modified'])
-            for group_idx, group in enumerate(groups):
-                for file_path in group:
-                    # Try to get file stats if path exists
-                    try:
-                        stat = Path(file_path).stat()
-                        size = stat.st_size
-                        mtime = datetime.fromtimestamp(stat.st_mtime).isoformat()
-                    except:
-                        size = 0
-                        mtime = ""
-                    writer.writerow([group_idx, file_path, size, "", mtime])
-        
-        return output_path
+            writer.writerow(["scan_id", "timestamp", "mode", "groups", "deleted", "failed", "bytes_reclaimed", "source"])
+            for i, r in enumerate(records):
+                writer.writerow([r.scan_id, r.timestamp, r.mode, r.groups, r.deleted, r.failed, r.bytes_reclaimed, r.source])
+                if progress_cb and (i + 1) % 50 == 0:
+                    progress_cb(i + 1, total)
+            if progress_cb:
+                progress_cb(total, total)
+            f.flush()
+            os.fsync(f.fileno())
 
-    def export_to_json(self, scan_id: str, output_path: Optional[Path] = None) -> Path:
-        """Export full scan metadata to JSON."""
-        entry = self.get_entry(scan_id)
-        if not entry:
-            raise ValueError(f"Scan not found: {scan_id}")
-        
-        if output_path is None:
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            output_path = self.exports_dir / f"scan_{scan_id}_{timestamp}.json"
-        
-        data = {
-            "metadata": entry.to_dict(),
-            "payload": self.load_payload(scan_id)
-        }
-        
-        with open(output_path, 'w', encoding='utf-8') as f:
-            json.dump(data, f, indent=2, ensure_ascii=False)
-        
-        return output_path
-
-    def compare_scans(self, baseline_id: str, compare_id: str) -> Dict[str, Any]:
-        """Compare two scans and return differences."""
-        baseline_entry = self.get_entry(baseline_id)
-        compare_entry = self.get_entry(compare_id)
-        
-        if not baseline_entry or not compare_entry:
-            raise ValueError("One or both scans not found")
-        
-        baseline_payload = self.load_payload(baseline_id)
-        compare_payload = self.load_payload(compare_id)
-        
-        baseline_groups = set(tuple(sorted(g)) for g in baseline_payload.get("payload", {}).get("groups", []))
-        compare_groups = set(tuple(sorted(g)) for g in compare_payload.get("payload", {}).get("groups", []))
-        
-        new_duplicates = compare_groups - baseline_groups
-        resolved_duplicates = baseline_groups - compare_groups
-        
-        return {
-            "baseline_scan": baseline_entry.name,
-            "compare_scan": compare_entry.name,
-            "baseline_date": baseline_entry.finished_at_iso,
-            "compare_date": compare_entry.finished_at_iso,
-            "new_duplicate_groups": len(new_duplicates),
-            "resolved_duplicate_groups": len(resolved_duplicates),
-            "new_duplicate_files": sum(len(g) for g in new_duplicates),
-            "space_reclaimed": baseline_entry.result_summary.duplicate_bytes - compare_entry.result_summary.duplicate_bytes,
-            "efficiency_delta": compare_entry.get_efficiency_score() - baseline_entry.get_efficiency_score(),
-        }
-
-    def get_statistics(self) -> Dict[str, Any]:
-        """Get aggregate statistics across all scans."""
-        entries = self.list_entries()
-        completed = [e for e in entries if e.status == ScanStatus.COMPLETED]
-        
-        if not completed:
-            return {}
-        
-        total_scanned = sum(e.result_summary.scanned_bytes for e in completed)
-        total_dupes = sum(e.result_summary.duplicate_bytes for e in completed)
-        total_duration = sum(e.duration_ms for e in completed)
-        
-        return {
-            "total_scans": len(entries),
-            "completed_scans": len(completed),
-            "total_files_scanned": sum(e.result_summary.scanned_files for e in completed),
-            "total_bytes_scanned": total_scanned,
-            "total_duplicate_bytes": total_dupes,
-            "average_scan_duration_ms": total_duration / len(completed) if completed else 0,
-            "average_efficiency": sum(e.get_efficiency_score() for e in completed) / len(completed) if completed else 0,
-            "peak_memory_ever": max((e.peak_memory_percent for e in completed), default=0),
-        }
-
-    def bulk_delete(self, scan_ids: List[str]) -> Tuple[int, List[str]]:
-        """Delete multiple scans, return (success_count, errors)."""
-        errors = []
-        success = 0
-        for scan_id in scan_ids:
+    def save_resume_payload(self, payload: ResumePayload) -> None:
+        """Persist resume payload (atomic write). Call when scan is cancelled for later resume."""
+        self._base_dir.mkdir(parents=True, exist_ok=True)
+        fd, tmp_path = tempfile.mkstemp(prefix="resume_", suffix=".json", dir=str(self._base_dir))
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(payload.to_dict(), f, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_path, self._resume_file)
+        except Exception:
             try:
-                self.delete_scan(scan_id)
-                success += 1
-            except Exception as e:
-                errors.append(f"{scan_id}: {e}")
-        return success, errors
-
-    def bulk_export(self, scan_ids: List[str], format: str = "json") -> List[Path]:
-        """Export multiple scans."""
-        paths = []
-        for scan_id in scan_ids:
-            try:
-                if format == "csv":
-                    paths.append(self.export_to_csv(scan_id))
-                else:
-                    paths.append(self.export_to_json(scan_id))
+                os.unlink(tmp_path)
             except Exception:
                 pass
-        return paths
 
-    # -------------------------
-    # Internal helpers
-    # -------------------------
-
-    def _duration_ms(self, start_iso: str, end_iso: str) -> int:
+    def get_latest_resume_payload(self) -> Optional[ResumePayload]:
+        """Load latest resume payload if any (e.g. for History Resume button)."""
+        if not self._resume_file.exists():
+            return None
         try:
-            s = datetime.fromisoformat(start_iso.replace("Z", "+00:00"))
-            e = datetime.fromisoformat(end_iso.replace("Z", "+00:00"))
-            return max(0, int((e - s).total_seconds() * 1000))
+            with open(self._resume_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return ResumePayload.from_dict(data)
         except Exception:
-            return 0
+            return None
 
-    def _try_stat_mtime(self, path_str: str) -> float:
-        try:
-            p = Path(path_str)
-            if p.exists():
-                return float(p.stat().st_mtime)
-        except Exception:
-            pass
-        return 0.0
+    def get_undo_candidates(self, *, since_hours: int = 24) -> List[Dict[str, Any]]:
+        """
+        Get recent deletions that could potentially be undone.
+        Only works for trash deletions.
+        """
+        since = datetime.now().timestamp() - (int(since_hours) * 60 * 60)
+        records = self.get_deletion_history(since=since, limit=1000)
 
-    def _read_index(self) -> Dict[str, Any]:
-        with _file_lock(self.lock_path):
-            return self._read_index_unlocked()
-
-    def _read_index_unlocked(self) -> Dict[str, Any]:
-        if not self.index_path.exists():
-            return {"schema_version": HISTORY_SCHEMA_VERSION, "entries": []}
-        try:
-            data = json.loads(self.index_path.read_text(encoding="utf-8"))
-            if int(data.get("schema_version", 0)) != HISTORY_SCHEMA_VERSION:
-                backup = self.index_path.with_suffix(".bak")
-                shutil.copy2(self.index_path, backup)
-                return {"schema_version": HISTORY_SCHEMA_VERSION, "entries": []}
-            return data
-        except Exception:
-            backup = self.index_path.with_suffix(".corrupt.bak")
-            try:
-                shutil.copy2(self.index_path, backup)
-            except Exception:
-                pass
-            return {"schema_version": HISTORY_SCHEMA_VERSION, "entries": []}
-
-    def _write_index(self, data: Dict[str, Any]) -> None:
-        with _file_lock(self.lock_path):
-            self._write_index_unlocked(data)
-
-    def _write_index_unlocked(self, data: Dict[str, Any]) -> None:
-        data = dict(data)
-        data["schema_version"] = HISTORY_SCHEMA_VERSION
-        _atomic_write_text(self.index_path, json.dumps(data, indent=2, ensure_ascii=False))
-
-    def _upsert_entry(self, entry: ScanHistoryEntry) -> None:
-        with _file_lock(self.lock_path):
-            idx = self._read_index_unlocked()
-            entries = idx.get("entries") or []
-            replaced = False
-            for i, d in enumerate(entries):
-                if str(d.get("scan_id")) == entry.scan_id:
-                    entries[i] = entry.to_dict()
-                    replaced = True
-                    break
-            if not replaced:
-                entries.append(entry.to_dict())
-            idx["entries"] = entries
-            self._write_index_unlocked(idx)
-
-    def _write_payload(self, scan_id: str, payload: Any, entry: ScanHistoryEntry) -> None:
-        payload_path = self.payload_dir / f"{scan_id}.json.gz"
-        blob = {
-            "payload_schema_version": PAYLOAD_SCHEMA_VERSION,
-            "scan_id": scan_id,
-            "root_path": entry.root_path,
-            "started_at_iso": entry.started_at_iso,
-            "finished_at_iso": entry.finished_at_iso,
-            "settings_snapshot": entry.settings_snapshot,
-            "result_summary": asdict(entry.result_summary),
-            "warnings_summary": asdict(entry.warnings_summary),
-            "health_summary": {
-                "peak_memory": entry.peak_memory_percent,
-                "peak_cpu": entry.peak_cpu_percent,
-                "snapshot_count": len(entry.health_snapshots),
-            },
-            "payload": to_jsonable(payload),
-        }
-        raw = json.dumps(blob, ensure_ascii=False).encode("utf-8")
-        compressed = gzip.compress(raw, compresslevel=6)
-        _atomic_write_bytes(payload_path, compressed)
+        candidates: List[Dict[str, Any]] = []
+        for r in records:
+            if r.mode == "trash":
+                candidates.append(
+                    {
+                        "scan_id": r.scan_id,
+                        "timestamp": r.timestamp,
+                        "files": r.details,
+                        "bytes": r.bytes_reclaimed,
+                    }
+                )
+        return candidates
