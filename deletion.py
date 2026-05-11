@@ -78,6 +78,21 @@ class TrashDeletionAdapter(DeletionPort):
     def can_handle(self, policy: DeletionPolicy) -> bool:
         return policy == DeletionPolicy.TRASH
 
+    def _fallback_destination(self, trash_dir: Path, path: Path) -> Path:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        candidate = trash_dir / f"{timestamp}_{path.name}"
+        if not candidate.exists():
+            return candidate
+
+        stem = path.stem
+        suffix = path.suffix
+        for i in range(1, 10_000):
+            candidate = trash_dir / f"{timestamp}_{stem}__{i}{suffix}"
+            if not candidate.exists():
+                return candidate
+
+        raise RuntimeError("Could not allocate unique trash destination")
+
     def delete(self, path: Path, request: DeletionRequest) -> SingleDeletionResult:
         if not path.exists():
             return SingleDeletionResult(
@@ -97,8 +112,7 @@ class TrashDeletionAdapter(DeletionPort):
                 trash_dir = Path.home() / ".cerebro" / "trash"
                 trash_dir.mkdir(parents=True, exist_ok=True)
 
-                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                dest = trash_dir / f"{timestamp}_{path.name}"
+                dest = self._fallback_destination(trash_dir, path)
                 shutil.move(str(path), str(dest))
 
             return SingleDeletionResult(
