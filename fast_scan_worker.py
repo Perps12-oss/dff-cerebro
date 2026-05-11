@@ -29,6 +29,7 @@ class FastScanConfig:
     media_type: str = "all"
     engine: str = "simple"
     scanner_tier: str = "turbo"  # NEW: turbo/ultra/quantum
+    use_optimized_scanner: bool = False
 
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> "FastScanConfig":
@@ -53,6 +54,7 @@ class FastScanConfig:
             media_type=media_type,
             engine=str(d.get("engine", "simple")).lower(),
             scanner_tier=str(d.get("scanner_tier", "turbo")).lower(),  # NEW
+            use_optimized_scanner=bool(d.get("use_optimized_scanner", False)),
         )
 
 
@@ -107,8 +109,9 @@ class FastScanWorker(QThread):
         try:
             root = str(self._cfg.root)
             
-            # Check if using optimized scanner tiers
-            if self._cfg.scanner_tier in ("turbo", "ultra", "quantum"):
+            # The optimized scanner tiers currently enumerate candidate files only;
+            # keep normal UI scans on FastPipeline so finished payloads include duplicate groups.
+            if self._cfg.use_optimized_scanner and self._cfg.scanner_tier in ("turbo", "ultra", "quantum"):
                 self._run_optimized_scan()
                 return
             
@@ -182,6 +185,13 @@ class FastScanWorker(QThread):
             payload.setdefault("file_count", int(payload.get("file_count", 0) or 0))
             payload.setdefault("total_size", int(payload.get("total_size", 0) or 0))
             payload.setdefault("scan_duration", float(payload.get("scan_duration", 0.0) or 0.0))
+            payload.setdefault("scanner_tier", self._cfg.scanner_tier)
+            groups = payload.get("groups") if isinstance(payload.get("groups"), list) else []
+            payload.setdefault("group_count", len(groups))
+            payload.setdefault(
+                "duplicate_count",
+                sum(max(0, len(g.get("paths", []) or []) - 1) for g in groups if isinstance(g, dict)),
+            )
 
             self.finished.emit(payload)
 

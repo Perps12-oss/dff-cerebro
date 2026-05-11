@@ -306,14 +306,32 @@ class LiveScanController(QObject):
         self._logger.info("Scan completed")
 
         self._snapshot.complete_scan()
+        payload = dict(result or {})
+        groups = payload.get("groups")
+        stats = payload.get("stats") if isinstance(payload.get("stats"), dict) else {}
+        if isinstance(groups, list):
+            group_count = len(groups)
+            duplicate_count = sum(
+                max(0, len(g.get("paths", []) or []) - 1)
+                for g in groups
+                if isinstance(g, dict)
+            )
+        else:
+            group_count = int(
+                payload.get("group_count", payload.get("groups_found", stats.get("duplicate_groups", 0))) or 0
+            )
+            duplicate_count = int(payload.get("duplicate_count", stats.get("duplicate_files", 0)) or 0)
+
+        payload["group_count"] = group_count
+        payload["groups_found"] = group_count
+        payload["duplicate_count"] = duplicate_count
         self._pending_snapshot_updates.update({
-            "duplicates_found": int(result.get("duplicate_count", 0) or 0),
-            "groups_found": int(result.get("group_count", result.get("groups_found", 0)) or 0),
+            "duplicates_found": duplicate_count,
+            "groups_found": group_count,
         })
         self._emit_snapshot_update()
         self._finish_running()
 
-        payload = dict(result or {})
         payload.setdefault("scan_id", self._scan_id)
 
         # Publish to bus ONCE (controller is the sole publisher)
