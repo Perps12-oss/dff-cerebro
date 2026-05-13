@@ -17,6 +17,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import os
 import shutil
+import uuid
 
 
 class DeletionPolicy(Enum):
@@ -98,7 +99,7 @@ class TrashDeletionAdapter(DeletionPort):
                 trash_dir.mkdir(parents=True, exist_ok=True)
 
                 timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                dest = trash_dir / f"{timestamp}_{path.name}"
+                dest = trash_dir / f"{timestamp}_{uuid.uuid4().hex}_{path.name}"
                 shutil.move(str(path), str(dest))
 
             return SingleDeletionResult(
