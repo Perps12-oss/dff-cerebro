@@ -1379,10 +1379,18 @@ class ReviewPage(BaseStation):
             delete_paths = [p for p in g.paths if not keep_map.get(p, True)]
 
             if delete_paths:
+                keep_paths = [p for p in g.paths if keep_map.get(p, True)]
+                if not keep_paths:
+                    # The UI should prevent this, but never emit an unsafe intent
+                    # that asks the pipeline to infer which file survives.
+                    continue
+
                 group_size = sum(os.path.getsize(p) for p in delete_paths if os.path.exists(p))
                 total_delete_size += group_size
                 delete_groups.append({
-                    "paths": delete_paths,
+                    "group_index": int(g.group_id),
+                    "keep": keep_paths[0],
+                    "delete": delete_paths,
                     "hint": g.hint,
                     "recoverable_bytes": group_size,
                 })
@@ -1396,7 +1404,7 @@ class ReviewPage(BaseStation):
             )
             return
 
-        total_files = sum(len(g["paths"]) for g in delete_groups)
+        total_files = sum(len(g["delete"]) for g in delete_groups)
 
         reply = QMessageBox.question(
             self,
@@ -1420,7 +1428,13 @@ class ReviewPage(BaseStation):
             "recoverable_bytes": total_delete_size,
         }
 
-        cleanup_data = {"groups": delete_groups, "stats": stats}
+        cleanup_data = {
+            "scan_id": str(self._result.get("scan_id") or ""),
+            "policy": {"mode": "trash"},
+            "groups": delete_groups,
+            "stats": stats,
+            "source": "review_page",
+        }
         self.cleanup_confirmed.emit(cleanup_data)
 
     def _on_cleanup_cancelled(self):
