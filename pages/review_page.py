@@ -45,6 +45,7 @@ from PySide6.QtWidgets import (
 from cerebro.ui.pages.base_station import BaseStation
 from cerebro.ui.state_bus import get_state_bus
 from cerebro.ui.theme_engine import get_theme_manager
+from cerebro.ui.pages.review_deletion_plan import build_cleanup_groups
 
 
 # ==============================================================================
@@ -1371,21 +1372,14 @@ class ReviewPage(BaseStation):
         self._open_ceremony()
 
     def _open_ceremony(self):
-        delete_groups = []
-        total_delete_size = 0
-
-        for g in self._filtered_groups:
-            keep_map = self._keep_states.get(g.group_id, {})
-            delete_paths = [p for p in g.paths if not keep_map.get(p, True)]
-
-            if delete_paths:
-                group_size = sum(os.path.getsize(p) for p in delete_paths if os.path.exists(p))
-                total_delete_size += group_size
-                delete_groups.append({
-                    "paths": delete_paths,
-                    "hint": g.hint,
-                    "recoverable_bytes": group_size,
-                })
+        try:
+            delete_groups, total_delete_size = build_cleanup_groups(
+                self._filtered_groups,
+                self._keep_states,
+            )
+        except ValueError as e:
+            QMessageBox.warning(self, "Invalid Selection", str(e))
+            return
 
         if not delete_groups:
             QMessageBox.information(
@@ -1420,7 +1414,12 @@ class ReviewPage(BaseStation):
             "recoverable_bytes": total_delete_size,
         }
 
-        cleanup_data = {"groups": delete_groups, "stats": stats}
+        cleanup_data = {
+            "groups": delete_groups,
+            "stats": stats,
+            "policy": {"mode": "trash"},
+            "source": "review_page",
+        }
         self.cleanup_confirmed.emit(cleanup_data)
 
     def _on_cleanup_cancelled(self):
