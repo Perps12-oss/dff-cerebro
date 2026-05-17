@@ -106,13 +106,10 @@ class FastScanWorker(QThread):
 
         try:
             root = str(self._cfg.root)
-            
-            # Check if using optimized scanner tiers
-            if self._cfg.scanner_tier in ("turbo", "ultra", "quantum"):
-                self._run_optimized_scan()
-                return
-            
-            # Fall back to legacy FastPipeline
+
+            # The optimized tier adapters currently yield files, not exact
+            # duplicate groups. Review and cleanup depend on groups, so keep
+            # the user-facing scan path on the exact FastPipeline.
             self._pipeline = FastPipeline(
                 max_workers=self._cfg.max_workers,
                 cache_path=self._cfg.cache_path,
@@ -176,12 +173,32 @@ class FastScanWorker(QThread):
 
             # Normalize payload fields for UI
             payload = dict(result or {})
+            stats = dict(payload.get("stats") or {})
+            groups = payload.get("groups") or []
+            if not isinstance(groups, list):
+                groups = []
+            group_count = len(groups)
+            duplicate_count = 0
+            for group in groups:
+                if isinstance(group, dict):
+                    paths = group.get("paths") or []
+                    count = group.get("count", len(paths) if isinstance(paths, list) else 0)
+                elif isinstance(group, (list, tuple)):
+                    count = len(group)
+                else:
+                    count = 0
+                duplicate_count += max(0, int(count or 0) - 1)
+
             payload.setdefault("scan_root", root)
             payload.setdefault("scan_name", self._cfg.scan_name or f"Scan of {root}")
-            payload.setdefault("groups", payload.get("groups") or [])
-            payload.setdefault("file_count", int(payload.get("file_count", 0) or 0))
+            payload["groups"] = groups
+            payload.setdefault("file_count", int(stats.get("files_scanned", 0) or 0))
             payload.setdefault("total_size", int(payload.get("total_size", 0) or 0))
             payload.setdefault("scan_duration", float(payload.get("scan_duration", 0.0) or 0.0))
+            payload.setdefault("scanner_tier", self._cfg.scanner_tier)
+            payload["group_count"] = group_count
+            payload["groups_found"] = group_count
+            payload["duplicate_count"] = duplicate_count
 
             self.finished.emit(payload)
 
