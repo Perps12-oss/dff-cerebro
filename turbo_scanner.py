@@ -577,7 +577,16 @@ class TurboScanner:
                 except:
                     continue
         
-        return all_files
+        seen_paths = set()
+        unique_files = []
+        for path, size, mtime in all_files:
+            path_key = os.path.normcase(os.path.abspath(str(path)))
+            if path_key in seen_paths:
+                continue
+            seen_paths.add(path_key)
+            unique_files.append((path, size, mtime))
+
+        return unique_files
     
     def _compute_hashes_parallel(
         self, 
