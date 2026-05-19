@@ -345,27 +345,13 @@ class FastPipeline:
     def _quick_hash_with_meta(self, f: FastFileInfo) -> Tuple[FastFileInfo, Optional[str]]:
         path = f.path
         try:
-            size = f.size
-            sample = 1 * 1024 * 1024
-
-            if size <= 3 * sample:
-                h = hashlib.md5()
-                with open(path, "rb", buffering=0) as fp:
-                    while True:
-                        b = fp.read(1024 * 1024)
-                        if not b:
-                            break
-                        h.update(b)
-                return f, h.hexdigest()
-
             h = hashlib.md5()
             with open(path, "rb", buffering=0) as fp:
-                h.update(fp.read(sample))
-                mid = size // 2
-                fp.seek(max(0, mid - sample // 2))
-                h.update(fp.read(sample))
-                fp.seek(max(0, size - sample))
-                h.update(fp.read(sample))
+                while True:
+                    b = fp.read(1024 * 1024)
+                    if not b:
+                        break
+                    h.update(b)
             return f, h.hexdigest()
         except Exception:
             return f, None
