@@ -52,8 +52,35 @@ def _load_fast_pipeline_module():
     spec = importlib.util.spec_from_file_location("critical_fast_pipeline", ROOT / "fast_pipeline.py")
     module = importlib.util.module_from_spec(spec)
     assert spec and spec.loader
+    sys.modules[spec.name] = module
     spec.loader.exec_module(module)
     return module
+
+
+def _load_history_modules():
+    """Load history store/models without executing pages/__init__.py."""
+    package_name = "critical_pages"
+    package = types.ModuleType(package_name)
+    package.__path__ = [str(ROOT / "pages")]
+    sys.modules[package_name] = package
+
+    models_spec = importlib.util.spec_from_file_location(
+        f"{package_name}.models", ROOT / "pages" / "models.py"
+    )
+    models = importlib.util.module_from_spec(models_spec)
+    assert models_spec and models_spec.loader
+    sys.modules[models_spec.name] = models
+    models_spec.loader.exec_module(models)
+
+    store_spec = importlib.util.spec_from_file_location(
+        f"{package_name}.store", ROOT / "pages" / "store.py"
+    )
+    store = importlib.util.module_from_spec(store_spec)
+    assert store_spec and store_spec.loader
+    sys.modules[store_spec.name] = store
+    store_spec.loader.exec_module(store)
+
+    return models, store
 
 
 class CriticalRegressionTests(unittest.TestCase):
@@ -86,8 +113,9 @@ class CriticalRegressionTests(unittest.TestCase):
                 self.assertNotIn(str(right), group["paths"])
 
     def test_history_schema_migration_preserves_existing_entries(self):
-        from pages.models import HISTORY_SCHEMA_VERSION
-        from pages.store import HistoryStore
+        models, store_module = _load_history_modules()
+        HISTORY_SCHEMA_VERSION = models.HISTORY_SCHEMA_VERSION
+        HistoryStore = store_module.HistoryStore
 
         with tempfile.TemporaryDirectory() as tmp:
             store = HistoryStore(base_dir=Path(tmp))
