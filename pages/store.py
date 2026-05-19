@@ -480,7 +480,13 @@ class HistoryStore:
             if int(data.get("schema_version", 0)) != HISTORY_SCHEMA_VERSION:
                 backup = self.index_path.with_suffix(".bak")
                 shutil.copy2(self.index_path, backup)
-                return {"schema_version": HISTORY_SCHEMA_VERSION, "entries": []}
+                entries = data.get("entries") if isinstance(data, dict) else []
+                if not isinstance(entries, list):
+                    entries = []
+                migrated = dict(data) if isinstance(data, dict) else {}
+                migrated["schema_version"] = HISTORY_SCHEMA_VERSION
+                migrated["entries"] = entries
+                return migrated
             return data
         except Exception:
             backup = self.index_path.with_suffix(".corrupt.bak")

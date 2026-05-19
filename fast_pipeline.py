@@ -39,10 +39,12 @@ class _HashCache:
     Backward-compatible adapter for the old fast cache interface.
 
     Old interface used:
-      get(path, size, mtime_seconds) -> quick_hash str | None
-      set_many([(path, size, mtime_seconds, quick_hash), ...])
+      get(path, size, mtime_seconds) -> hash str | None
+      set_many([(path, size, mtime_seconds, hash), ...])
 
-    Internally it uses HashCache (mtime in ns + dev/inode).
+    Internally it uses HashCache (mtime in ns + dev/inode) and stores full
+    content hashes. Old sampled quick-hash cache entries are intentionally not
+    reused because cleanup decisions require authoritative duplicate groups.
     """
 
     def __init__(self, db_path: Path):
@@ -58,7 +60,7 @@ class _HashCache:
     def get(self, path: str, size: int, mtime: float) -> Optional[str]:
         try:
             sig = StatSignature(size=int(size), mtime_ns=int(float(mtime) * 1_000_000_000), dev=0, inode=0)
-            return self._cache.get_quick(path, sig)
+            return self._cache.get_full(path, sig)
         except Exception:
             return None
 
@@ -66,7 +68,7 @@ class _HashCache:
         try:
             for p, size, mtime, qh in rows:
                 sig = StatSignature(size=int(size), mtime_ns=int(float(mtime) * 1_000_000_000), dev=0, inode=0)
-                self._cache.set_quick(p, sig, str(qh), algo="md5")
+                self._cache.set_full(p, sig, str(qh), algo="md5")
         except Exception:
             return
 
@@ -343,27 +345,13 @@ class FastPipeline:
     def _quick_hash_with_meta(self, f: FastFileInfo) -> Tuple[FastFileInfo, Optional[str]]:
         path = f.path
         try:
-            size = f.size
-            sample = 1 * 1024 * 1024
-
-            if size <= 3 * sample:
-                h = hashlib.md5()
-                with open(path, "rb", buffering=0) as fp:
-                    while True:
-                        b = fp.read(1024 * 1024)
-                        if not b:
-                            break
-                        h.update(b)
-                return f, h.hexdigest()
-
             h = hashlib.md5()
             with open(path, "rb", buffering=0) as fp:
-                h.update(fp.read(sample))
-                mid = size // 2
-                fp.seek(max(0, mid - sample // 2))
-                h.update(fp.read(sample))
-                fp.seek(max(0, size - sample))
-                h.update(fp.read(sample))
+                while True:
+                    b = fp.read(1024 * 1024)
+                    if not b:
+                        break
+                    h.update(b)
             return f, h.hexdigest()
         except Exception:
             return f, None

@@ -182,6 +182,8 @@ class FastScanWorker(QThread):
             payload.setdefault("file_count", int(payload.get("file_count", 0) or 0))
             payload.setdefault("total_size", int(payload.get("total_size", 0) or 0))
             payload.setdefault("scan_duration", float(payload.get("scan_duration", 0.0) or 0.0))
+            payload.setdefault("scanner_tier", self._cfg.scanner_tier)
+            payload.setdefault("scanner_name", "FastPipeline")
 
             self.finished.emit(payload)
 
