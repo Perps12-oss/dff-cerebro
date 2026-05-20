@@ -486,6 +486,38 @@ def extract_group_data(group: Any, idx: int = 0) -> GroupData:
     return GroupData(paths=[], group_id=idx)
 
 
+def build_cleanup_deletion_groups(
+    groups: List[GroupData],
+    keep_states: Dict[int, Dict[str, bool]],
+) -> Tuple[List[Dict[str, Any]], int]:
+    """Build strict DeletionPlan groups from ReviewPage keep/delete state."""
+    delete_groups: List[Dict[str, Any]] = []
+    total_delete_size = 0
+
+    for g in groups:
+        keep_map = keep_states.get(g.group_id, {})
+        delete_paths = [p for p in g.paths if not keep_map.get(p, True)]
+        if not delete_paths:
+            continue
+
+        keeper = next((p for p in g.paths if keep_map.get(p, True)), "")
+        if not keeper:
+            # UI should prevent this; never guess a keeper for destructive work.
+            continue
+
+        group_size = sum(os.path.getsize(p) for p in delete_paths if os.path.exists(p))
+        total_delete_size += group_size
+        delete_groups.append({
+            "group_index": g.group_id,
+            "keep": keeper,
+            "delete": delete_paths,
+            "hint": g.hint,
+            "recoverable_bytes": group_size,
+        })
+
+    return delete_groups, total_delete_size
+
+
 # ==============================================================================
 # DUAL PANE COMPARISON
 # ==============================================================================
@@ -1371,21 +1403,10 @@ class ReviewPage(BaseStation):
         self._open_ceremony()
 
     def _open_ceremony(self):
-        delete_groups = []
-        total_delete_size = 0
-
-        for g in self._filtered_groups:
-            keep_map = self._keep_states.get(g.group_id, {})
-            delete_paths = [p for p in g.paths if not keep_map.get(p, True)]
-
-            if delete_paths:
-                group_size = sum(os.path.getsize(p) for p in delete_paths if os.path.exists(p))
-                total_delete_size += group_size
-                delete_groups.append({
-                    "paths": delete_paths,
-                    "hint": g.hint,
-                    "recoverable_bytes": group_size,
-                })
+        delete_groups, total_delete_size = build_cleanup_deletion_groups(
+            self._filtered_groups,
+            self._keep_states,
+        )
 
         if not delete_groups:
             QMessageBox.information(
@@ -1396,7 +1417,7 @@ class ReviewPage(BaseStation):
             )
             return
 
-        total_files = sum(len(g["paths"]) for g in delete_groups)
+        total_files = sum(len(g["delete"]) for g in delete_groups)
 
         reply = QMessageBox.question(
             self,
@@ -1420,7 +1441,13 @@ class ReviewPage(BaseStation):
             "recoverable_bytes": total_delete_size,
         }
 
-        cleanup_data = {"groups": delete_groups, "stats": stats}
+        cleanup_data = {
+            "scan_id": str(self._result.get("scan_id") or ""),
+            "policy": {"mode": "trash"},
+            "groups": delete_groups,
+            "stats": stats,
+            "source": "review_page",
+        }
         self.cleanup_confirmed.emit(cleanup_data)
 
     def _on_cleanup_cancelled(self):

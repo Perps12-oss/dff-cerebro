@@ -107,10 +107,14 @@ class FastScanWorker(QThread):
         try:
             root = str(self._cfg.root)
             
-            # Check if using optimized scanner tiers
+            # The optimized scanner adapters currently yield per-file metadata
+            # instead of the duplicate group contract consumed by ReviewPage.
+            # Keep the public tier selection, but use the grouped pipeline until
+            # those scanners expose authoritative grouped results.
             if self._cfg.scanner_tier in ("turbo", "ultra", "quantum"):
-                self._run_optimized_scan()
-                return
+                self.phase_changed.emit(
+                    f"{self._cfg.scanner_tier.title()} scanner selected; preparing duplicate groups..."
+                )
             
             # Fall back to legacy FastPipeline
             self._pipeline = FastPipeline(
@@ -178,10 +182,25 @@ class FastScanWorker(QThread):
             payload = dict(result or {})
             payload.setdefault("scan_root", root)
             payload.setdefault("scan_name", self._cfg.scan_name or f"Scan of {root}")
-            payload.setdefault("groups", payload.get("groups") or [])
+            groups = payload.get("groups") or []
+            payload["groups"] = groups
+            group_count = len(groups) if isinstance(groups, list) else 0
+            duplicate_count = 0
+            if isinstance(groups, list):
+                for group in groups:
+                    if isinstance(group, dict):
+                        paths = group.get("paths") or group.get("files") or []
+                        duplicate_count += max(0, len(paths) - 1)
+                    elif isinstance(group, (list, tuple)):
+                        duplicate_count += max(0, len(group) - 1)
+            payload.setdefault("group_count", group_count)
+            payload.setdefault("groups_found", group_count)
+            payload.setdefault("duplicate_count", duplicate_count)
             payload.setdefault("file_count", int(payload.get("file_count", 0) or 0))
             payload.setdefault("total_size", int(payload.get("total_size", 0) or 0))
             payload.setdefault("scan_duration", float(payload.get("scan_duration", 0.0) or 0.0))
+            payload.setdefault("scanner_tier", self._cfg.scanner_tier)
+            payload.setdefault("scanner_name", "FastPipeline")
 
             self.finished.emit(payload)
 

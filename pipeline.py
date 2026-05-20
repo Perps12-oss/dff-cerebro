@@ -181,8 +181,10 @@ class CerebroPipeline:
                     )
                 )
 
-        # Raise only if no keeper for all groups, or deletion requested but no operations produced
-        if errors:
+        # Stale UI state in one group should not discard unrelated valid deletes.
+        if errors and operations:
+            self._log(f"Deletion plan skipped invalid groups: {'; '.join(errors)}", level="warning")
+        elif errors:
             msg = "; ".join(errors)
             self._log(f"Deletion plan validation failed: {msg}", level="error")
             raise ValueError(f"Deletion plan validation failed: {msg}")
@@ -194,6 +196,7 @@ class CerebroPipeline:
             "groups": len(groups),
             "files": len(operations),
             "bytes": sum(int(op.size or 0) for op in operations),
+            "validation_errors": len(errors),
             "validated_at": datetime.now().isoformat(),
         }
 
