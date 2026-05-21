@@ -51,6 +51,7 @@ def load_fast_pipeline_module():
     spec = importlib.util.spec_from_file_location("fast_pipeline_under_test", ROOT_DIR / "fast_pipeline.py")
     module = importlib.util.module_from_spec(spec)
     assert spec and spec.loader
+    sys.modules[spec.name] = module
     spec.loader.exec_module(module)
     return module
 
