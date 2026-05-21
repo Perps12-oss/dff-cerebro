@@ -4,6 +4,7 @@ from __future__ import annotations
 import sys
 import time
 import traceback
+import hashlib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -105,20 +106,42 @@ class FastScanWorker(QThread):
         self._last_groups = 0
 
         try:
-            root = str(self._cfg.root)
-            
-            # Check if using optimized scanner tiers
-            if self._cfg.scanner_tier in ("turbo", "ultra", "quantum"):
+            # Turbo is the default production path. It must return duplicate groups,
+            # not just discovered files, because ReviewPage consumes groups directly.
+            if self._cfg.scanner_tier == "turbo":
+                self.phase_changed.emit("TurboScanner: Scanning for exact duplicates...")
+                self._run_fast_pipeline_scan(scanner_tier="turbo", scanner_name="TurboScanner")
+                return
+
+            # Experimental tiers keep their specialized discovery path.
+            if self._cfg.scanner_tier in ("ultra", "quantum"):
                 self._run_optimized_scan()
                 return
-            
-            # Fall back to legacy FastPipeline
-            self._pipeline = FastPipeline(
-                max_workers=self._cfg.max_workers,
-                cache_path=self._cfg.cache_path,
-                engine=self._cfg.engine,
-            )
 
+            # Fall back to legacy FastPipeline
+            self._run_fast_pipeline_scan()
+
+        except Exception as e:
+            msg = f"{e}"
+            tb = traceback.format_exc()
+            self.error_occurred.emit(msg)
+            self.failed.emit(tb)
+
+    def _run_fast_pipeline_scan(
+        self,
+        *,
+        scanner_tier: Optional[str] = None,
+        scanner_name: Optional[str] = None,
+    ) -> None:
+        root = str(self._cfg.root)
+
+        self._pipeline = FastPipeline(
+            max_workers=self._cfg.max_workers,
+            cache_path=self._cfg.cache_path,
+            engine=self._cfg.engine,
+        )
+
+        try:
             def progress_cb(percent: int, message: str, stats: Dict[str, Any]) -> None:
                 if self._cancelled:
                     return
@@ -176,12 +199,26 @@ class FastScanWorker(QThread):
 
             # Normalize payload fields for UI
             payload = dict(result or {})
+            groups = payload.get("groups") or []
+            stats = dict(payload.get("stats") or {})
+            group_count = len(groups) if isinstance(groups, list) else int(payload.get("group_count", 0) or 0)
+            duplicate_count = 0
+            if isinstance(groups, list):
+                duplicate_count = sum(len(g.get("paths") or []) for g in groups if isinstance(g, dict))
+
             payload.setdefault("scan_root", root)
             payload.setdefault("scan_name", self._cfg.scan_name or f"Scan of {root}")
-            payload.setdefault("groups", payload.get("groups") or [])
-            payload.setdefault("file_count", int(payload.get("file_count", 0) or 0))
-            payload.setdefault("total_size", int(payload.get("total_size", 0) or 0))
-            payload.setdefault("scan_duration", float(payload.get("scan_duration", 0.0) or 0.0))
+            payload.setdefault("groups", groups)
+            payload.setdefault("group_count", group_count)
+            payload.setdefault("groups_found", group_count)
+            payload.setdefault("duplicate_count", duplicate_count)
+            payload.setdefault("file_count", int(payload.get("file_count", stats.get("files_scanned", 0)) or 0))
+            payload.setdefault("total_size", int(payload.get("total_size", stats.get("total_size", 0)) or 0))
+            payload.setdefault("scan_duration", float(payload.get("scan_duration", stats.get("time_seconds", 0.0)) or 0.0))
+            if scanner_tier:
+                payload.setdefault("scanner_tier", scanner_tier)
+            if scanner_name:
+                payload.setdefault("scanner_name", scanner_name)
 
             self.finished.emit(payload)
 
@@ -292,6 +329,14 @@ class FastScanWorker(QThread):
                 
                 files_found.append(file_meta)
             
+            # Phase: Exact duplicate grouping
+            self.phase_changed.emit(f"{scanner_name}: Verifying duplicate groups...")
+            groups = self._group_exact_duplicates(files_found)
+
+            if self._cancelled:
+                self.cancelled.emit()
+                return
+
             # Phase: Complete
             elapsed = time.perf_counter() - self._start_ts
             self.phase_changed.emit(f"{scanner_name}: Completed")
@@ -305,7 +350,10 @@ class FastScanWorker(QThread):
                 "scan_duration": elapsed,
                 "scanner_tier": tier,
                 "scanner_name": scanner_name,
-                "groups": groups_found,  # TODO: Group duplicates
+                "groups": groups,
+                "group_count": len(groups),
+                "groups_found": len(groups),
+                "duplicate_count": sum(len(g.get("paths") or []) for g in groups),
                 "cancelled": False,
             }
             
@@ -327,3 +375,63 @@ class FastScanWorker(QThread):
             tb = traceback.format_exc()
             self.error_occurred.emit(msg)
             self.failed.emit(tb)
+
+    def _group_exact_duplicates(self, files_found: List[Any]) -> List[Dict[str, Any]]:
+        by_size: Dict[int, List[str]] = {}
+        for file_meta in files_found:
+            try:
+                path = str(getattr(file_meta, "path", "") or "")
+                size = int(getattr(file_meta, "size", 0) or 0)
+            except Exception:
+                continue
+            if path and size >= int(self._cfg.min_size_bytes):
+                by_size.setdefault(size, []).append(path)
+
+        groups_by_hash: Dict[tuple[int, str], List[str]] = {}
+        candidates = [(size, path) for size, paths in by_size.items() if len(paths) > 1 for path in paths]
+        total = len(candidates)
+        scanned_bytes = sum(size * len(paths) for size, paths in by_size.items())
+
+        for idx, (size, path) in enumerate(candidates, start=1):
+            if self._cancelled:
+                break
+            digest = self._full_hash_path(path)
+            if not digest:
+                continue
+            groups_by_hash.setdefault((size, digest), []).append(path)
+
+            if idx % 64 == 0 or idx == total:
+                elapsed = max(0.0, time.perf_counter() - self._start_ts)
+                self.progress_updated.emit(ScanProgress(
+                    phase="Verifying duplicates",
+                    message=f"Verified {idx:,}/{total:,} candidate files",
+                    percent=0.0,
+                    scanned_files=len(files_found),
+                    scanned_bytes=scanned_bytes,
+                    elapsed_seconds=elapsed,
+                    current_path=path,
+                ))
+
+        groups: List[Dict[str, Any]] = []
+        for (size, digest), paths in groups_by_hash.items():
+            if len(paths) > 1:
+                groups.append({
+                    "hash": digest,
+                    "size": size,
+                    "paths": paths,
+                    "count": len(paths),
+                })
+        return groups
+
+    def _full_hash_path(self, path: str) -> Optional[str]:
+        try:
+            h = hashlib.md5()
+            with open(path, "rb", buffering=0) as fp:
+                while True:
+                    chunk = fp.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    h.update(chunk)
+            return h.hexdigest()
+        except Exception:
+            return None
