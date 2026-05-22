@@ -148,6 +148,7 @@ def _load_review_page_module():
     spec = importlib.util.spec_from_file_location("review_page_under_test", module_path)
     module = importlib.util.module_from_spec(spec)
     assert spec.loader is not None
+    sys.modules[spec.name] = module
     spec.loader.exec_module(module)
     return module
 
