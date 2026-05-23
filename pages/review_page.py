@@ -486,6 +486,64 @@ def extract_group_data(group: Any, idx: int = 0) -> GroupData:
     return GroupData(paths=[], group_id=idx)
 
 
+def build_cleanup_payload(
+    groups: List[GroupData],
+    keep_states: Dict[int, Dict[str, bool]],
+    *,
+    scan_id: str = "",
+    mode: str = "trash",
+    source: str = "review_page",
+) -> Dict[str, Any]:
+    """
+    Build the strict DeletionPlan payload consumed by MainWindow.
+
+    Review state can keep more than one file in a duplicate group; the pipeline
+    only needs one explicit survivor to prove the group is not deleting all
+    copies, so we use the first kept path as the representative keeper.
+    """
+    delete_groups: List[Dict[str, Any]] = []
+    total_delete_size = 0
+
+    for g in groups:
+        keep_map = keep_states.get(g.group_id, {})
+        delete_paths = [p for p in g.paths if not keep_map.get(p, True)]
+
+        if not delete_paths:
+            continue
+
+        delete_path_set = set(delete_paths)
+        keep_paths = [
+            p for p in g.paths
+            if p not in delete_path_set and keep_map.get(p, True)
+        ]
+        if not keep_paths:
+            raise ValueError("Invalid cleanup selection: each group must keep at least one file.")
+
+        group_size = sum(os.path.getsize(p) for p in delete_paths if os.path.exists(p))
+        total_delete_size += group_size
+        delete_groups.append({
+            "group_index": int(g.group_id),
+            "keep": keep_paths[0],
+            "delete": delete_paths,
+            "hint": g.hint,
+            "recoverable_bytes": group_size,
+        })
+
+    stats = {
+        "group_count": len(delete_groups),
+        "file_count": sum(len(g["delete"]) for g in delete_groups),
+        "recoverable_bytes": total_delete_size,
+    }
+
+    return {
+        "scan_id": str(scan_id or ""),
+        "policy": {"mode": str(mode or "trash")},
+        "groups": delete_groups,
+        "stats": stats,
+        "source": str(source or "review_page"),
+    }
+
+
 # ==============================================================================
 # DUAL PANE COMPARISON
 # ==============================================================================
@@ -1371,21 +1429,19 @@ class ReviewPage(BaseStation):
         self._open_ceremony()
 
     def _open_ceremony(self):
-        delete_groups = []
-        total_delete_size = 0
+        try:
+            cleanup_data = build_cleanup_payload(
+                self._filtered_groups,
+                self._keep_states,
+                scan_id=str(self._result.get("scan_id") or ""),
+                mode="trash",
+            )
+        except ValueError as e:
+            QMessageBox.warning(self, "Invalid Selection", str(e))
+            return
 
-        for g in self._filtered_groups:
-            keep_map = self._keep_states.get(g.group_id, {})
-            delete_paths = [p for p in g.paths if not keep_map.get(p, True)]
-
-            if delete_paths:
-                group_size = sum(os.path.getsize(p) for p in delete_paths if os.path.exists(p))
-                total_delete_size += group_size
-                delete_groups.append({
-                    "paths": delete_paths,
-                    "hint": g.hint,
-                    "recoverable_bytes": group_size,
-                })
+        delete_groups = cleanup_data["groups"]
+        total_delete_size = int(cleanup_data["stats"]["recoverable_bytes"])
 
         if not delete_groups:
             QMessageBox.information(
@@ -1396,7 +1452,7 @@ class ReviewPage(BaseStation):
             )
             return
 
-        total_files = sum(len(g["paths"]) for g in delete_groups)
+        total_files = int(cleanup_data["stats"]["file_count"])
 
         reply = QMessageBox.question(
             self,
@@ -1414,13 +1470,6 @@ class ReviewPage(BaseStation):
         self._progress_dialog.cancelled.connect(self._on_cleanup_cancelled)
         self._progress_dialog.show()
 
-        stats = {
-            "group_count": len(delete_groups),
-            "file_count": total_files,
-            "recoverable_bytes": total_delete_size,
-        }
-
-        cleanup_data = {"groups": delete_groups, "stats": stats}
         self.cleanup_confirmed.emit(cleanup_data)
 
     def _on_cleanup_cancelled(self):
@@ -1539,5 +1588,6 @@ __all__ = [
     "AsyncThumbnailLoader",
     "format_bytes",
     "extract_group_data",
+    "build_cleanup_payload",
     "get_file_category",
 ]
