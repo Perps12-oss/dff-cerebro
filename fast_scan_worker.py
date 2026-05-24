@@ -2,11 +2,13 @@
 from __future__ import annotations
 
 import sys
+import hashlib
 import time
 import traceback
+from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, Iterable, List, Optional
 
 from PySide6.QtCore import QThread, Signal, QObject
 
@@ -54,6 +56,99 @@ class FastScanConfig:
             engine=str(d.get("engine", "simple")).lower(),
             scanner_tier=str(d.get("scanner_tier", "turbo")).lower(),  # NEW
         )
+
+
+def _metadata_path(file_meta: Any) -> Optional[Path]:
+    raw_path = getattr(file_meta, "path", None)
+    if not raw_path:
+        return None
+    try:
+        return Path(raw_path)
+    except TypeError:
+        return None
+
+
+def _metadata_size(file_meta: Any, path: Path) -> Optional[int]:
+    try:
+        size = int(getattr(file_meta, "size"))
+    except Exception:
+        try:
+            size = int(path.stat().st_size)
+        except Exception:
+            return None
+    return size if size >= 0 else None
+
+
+def _full_file_hash(path: Path) -> Optional[str]:
+    digest = hashlib.sha256()
+    try:
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
+    except Exception:
+        return None
+
+
+def build_duplicate_groups(
+    file_metadata: Iterable[Any],
+    *,
+    cancel_check: Optional[Callable[[], bool]] = None,
+) -> List[Dict[str, Any]]:
+    """
+    Build ReviewPage-compatible duplicate groups from scanner metadata.
+
+    Optimized scanners may yield candidate files without preserving their
+    grouping payload, so the worker must reconstruct authoritative groups
+    before handing results to deletion UI.
+    """
+    by_size: Dict[int, List[Path]] = defaultdict(list)
+    for file_meta in file_metadata:
+        if cancel_check and cancel_check():
+            return []
+
+        path = _metadata_path(file_meta)
+        if path is None:
+            continue
+
+        size = _metadata_size(file_meta, path)
+        if size is None:
+            continue
+
+        by_size[size].append(path)
+
+    groups: List[Dict[str, Any]] = []
+    for size in sorted(by_size):
+        paths = by_size[size]
+        if len(paths) < 2:
+            continue
+
+        by_hash: Dict[str, List[Path]] = defaultdict(list)
+        for path in paths:
+            if cancel_check and cancel_check():
+                return []
+
+            digest = _full_file_hash(path)
+            if digest:
+                by_hash[digest].append(path)
+
+        for digest in sorted(by_hash):
+            duplicate_paths = by_hash[digest]
+            if len(duplicate_paths) < 2:
+                continue
+
+            sorted_paths = sorted(str(path) for path in duplicate_paths)
+            groups.append(
+                {
+                    "hash": digest,
+                    "size": size,
+                    "paths": sorted_paths,
+                    "count": len(sorted_paths),
+                    "recoverable_bytes": int(size) * (len(sorted_paths) - 1),
+                }
+            )
+
+    return groups
 
 
 class FastScanWorker(QThread):
@@ -262,7 +357,6 @@ class FastScanWorker(QThread):
             self.phase_changed.emit(f"{scanner_name}: Discovering files...")
             
             files_found = []
-            groups_found = {}
             processed_count = 0
             total_size = 0
             
@@ -292,6 +386,19 @@ class FastScanWorker(QThread):
                 
                 files_found.append(file_meta)
             
+            # Phase: Group duplicates
+            elapsed = time.perf_counter() - self._start_ts
+            self.phase_changed.emit(f"{scanner_name}: Building duplicate groups...")
+            groups_found = build_duplicate_groups(
+                files_found,
+                cancel_check=lambda: bool(self._cancelled),
+            )
+            if self._cancelled:
+                self.cancelled.emit()
+                return
+            if groups_found:
+                self.group_discovered.emit(len(groups_found))
+
             # Phase: Complete
             elapsed = time.perf_counter() - self._start_ts
             self.phase_changed.emit(f"{scanner_name}: Completed")
@@ -305,7 +412,10 @@ class FastScanWorker(QThread):
                 "scan_duration": elapsed,
                 "scanner_tier": tier,
                 "scanner_name": scanner_name,
-                "groups": groups_found,  # TODO: Group duplicates
+                "groups": groups_found,
+                "group_count": len(groups_found),
+                "groups_found": len(groups_found),
+                "duplicate_count": sum(max(0, int(group.get("count", 0)) - 1) for group in groups_found),
                 "cancelled": False,
             }
             

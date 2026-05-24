@@ -58,7 +58,7 @@ class _HashCache:
     def get(self, path: str, size: int, mtime: float) -> Optional[str]:
         try:
             sig = StatSignature(size=int(size), mtime_ns=int(float(mtime) * 1_000_000_000), dev=0, inode=0)
-            return self._cache.get_quick(path, sig)
+            return self._cache.get_quick(path, sig, algo="md5", quick_bytes=0)
         except Exception:
             return None
 

@@ -316,7 +316,7 @@ def compute_hash_cached(
         
         # Try cache first
         if quick:
-            cached = cache.get_quick(str(path), sig)
+            cached = cache.get_quick(str(path), sig, algo=algorithm, quick_bytes=QUICK_HASH_SIZE)
             if cached:
                 return cached
             
@@ -326,7 +326,7 @@ def compute_hash_cached(
                 cache.set_quick(path, sig, hash_val, algo=algorithm, quick_bytes=QUICK_HASH_SIZE)
             return hash_val
         else:
-            cached = cache.get_full(str(path), sig)
+            cached = cache.get_full(str(path), sig, algo=algorithm)
             if cached:
                 return cached
             

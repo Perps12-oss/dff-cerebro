@@ -170,11 +170,16 @@ def compute_hash_with_cache(
         
         # Check cache
         if quick:
-            cached = cache.get_quick(str(path), sig)
+            cached = cache.get_quick(
+                str(path),
+                sig,
+                algo=algorithm,
+                quick_bytes=QUICK_HASH_HEAD + QUICK_HASH_TAIL,
+            )
             if cached:
                 return cached
         else:
-            cached = cache.get_full(str(path), sig)
+            cached = cache.get_full(str(path), sig, algo=algorithm)
             if cached:
                 return cached
         
