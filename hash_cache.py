@@ -133,12 +133,23 @@ class HashCache:
     # Quick hash
     # ------------------------------------------------------------------
 
-    def get_quick(self, path: str | Path, sig: StatSignature) -> Optional[str]:
+    def get_quick(
+        self,
+        path: str | Path,
+        sig: StatSignature,
+        *,
+        algo: Optional[str] = None,
+        quick_bytes: Optional[int] = None,
+    ) -> Optional[str]:
         row = self._get_row(path)
         if not row:
             return None
-        size, mtime_ns, dev, inode, quick_hash = row
+        size, mtime_ns, dev, inode, quick_hash, quick_algo, stored_quick_bytes = row
         if (size, mtime_ns, dev, inode) != (sig.size, sig.mtime_ns, sig.dev, sig.inode):
+            return None
+        if algo is not None and (quick_algo or "").lower() != str(algo).lower():
+            return None
+        if quick_bytes is not None and int(stored_quick_bytes or 0) != int(quick_bytes or 0):
             return None
         return quick_hash
 
@@ -163,12 +174,20 @@ class HashCache:
     # Full hash
     # ------------------------------------------------------------------
 
-    def get_full(self, path: str | Path, sig: StatSignature) -> Optional[str]:
+    def get_full(
+        self,
+        path: str | Path,
+        sig: StatSignature,
+        *,
+        algo: Optional[str] = None,
+    ) -> Optional[str]:
         row = self._get_row_full(path)
         if not row:
             return None
-        size, mtime_ns, dev, inode, full_hash = row
+        size, mtime_ns, dev, inode, full_hash, full_algo = row
         if (size, mtime_ns, dev, inode) != (sig.size, sig.mtime_ns, sig.dev, sig.inode):
+            return None
+        if algo is not None and (full_algo or "").lower() != str(algo).lower():
             return None
         return full_hash
 
@@ -189,20 +208,20 @@ class HashCache:
     def _require_conn(self) -> sqlite3.Connection:
         return self.get_connection()
 
-    def _get_row(self, path: str | Path) -> Optional[Tuple[int, int, int, int, Optional[str]]]:
+    def _get_row(self, path: str | Path) -> Optional[Tuple[int, int, int, int, Optional[str], Optional[str], int]]:
         conn = self._require_conn()
         p = str(path)
         cur = conn.execute(
-            "SELECT size, mtime_ns, dev, inode, quick_hash FROM file_hashes WHERE path=?",
+            "SELECT size, mtime_ns, dev, inode, quick_hash, quick_algo, quick_bytes FROM file_hashes WHERE path=?",
             (p,),
         )
         return cur.fetchone()
 
-    def _get_row_full(self, path: str | Path) -> Optional[Tuple[int, int, int, int, Optional[str]]]:
+    def _get_row_full(self, path: str | Path) -> Optional[Tuple[int, int, int, int, Optional[str], Optional[str]]]:
         conn = self._require_conn()
         p = str(path)
         cur = conn.execute(
-            "SELECT size, mtime_ns, dev, inode, full_hash FROM file_hashes WHERE path=?",
+            "SELECT size, mtime_ns, dev, inode, full_hash, full_algo FROM file_hashes WHERE path=?",
             (p,),
         )
         return cur.fetchone()
