@@ -248,8 +248,25 @@ class DeletionEngine:
                     path = Path(op)
                 except Exception:
                     continue
+            path = Path(path)
 
-            res = self.delete_one(Path(path), request)
+            kept_path = getattr(op, "kept_path", None)
+            if kept_path:
+                kept_path = Path(kept_path)
+                if not kept_path.exists():
+                    failed.append((path, f"Keeper no longer exists: {kept_path}"))
+                    continue
+
+                try:
+                    if path.resolve() == kept_path.resolve():
+                        failed.append((path, "Refusing to delete keeper path"))
+                        continue
+                except Exception:
+                    # If resolution fails, let the delete adapter perform its
+                    # normal existence/permission checks for the target path.
+                    pass
+
+            res = self.delete_one(path, request)
             if res.success:
                 deleted.append(res.path)
                 bytes_reclaimed += int(res.bytes_reclaimed or 0)

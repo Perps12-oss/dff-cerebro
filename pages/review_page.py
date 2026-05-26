@@ -1376,12 +1376,16 @@ class ReviewPage(BaseStation):
 
         for g in self._filtered_groups:
             keep_map = self._keep_states.get(g.group_id, {})
+            keep_paths = [p for p in g.paths if keep_map.get(p, True)]
             delete_paths = [p for p in g.paths if not keep_map.get(p, True)]
 
-            if delete_paths:
+            if delete_paths and keep_paths:
                 group_size = sum(os.path.getsize(p) for p in delete_paths if os.path.exists(p))
                 total_delete_size += group_size
                 delete_groups.append({
+                    "group_index": g.group_id,
+                    "keep": keep_paths[0],
+                    "delete": delete_paths,
                     "paths": delete_paths,
                     "hint": g.hint,
                     "recoverable_bytes": group_size,
@@ -1420,7 +1424,13 @@ class ReviewPage(BaseStation):
             "recoverable_bytes": total_delete_size,
         }
 
-        cleanup_data = {"groups": delete_groups, "stats": stats}
+        cleanup_data = {
+            "scan_id": str(self._result.get("scan_id") or ""),
+            "policy": {"mode": "trash"},
+            "groups": delete_groups,
+            "stats": stats,
+            "source": "review_page",
+        }
         self.cleanup_confirmed.emit(cleanup_data)
 
     def _on_cleanup_cancelled(self):
