@@ -122,6 +122,7 @@ def _load_worker_module():
     spec = importlib.util.spec_from_file_location("fast_scan_worker_under_test", module_path)
     module = importlib.util.module_from_spec(spec)
     assert spec and spec.loader
+    sys.modules[spec.name] = module
     spec.loader.exec_module(module)
     return module
 
