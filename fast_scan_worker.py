@@ -107,8 +107,9 @@ class FastScanWorker(QThread):
         try:
             root = str(self._cfg.root)
             
-            # Check if using optimized scanner tiers
-            if self._cfg.scanner_tier in ("turbo", "ultra", "quantum"):
+            # Ultra/Quantum are experimental scanner tiers.  Turbo remains on
+            # FastPipeline because it is the implemented duplicate grouping path.
+            if self._cfg.scanner_tier in ("ultra", "quantum"):
                 self._run_optimized_scan()
                 return
             
@@ -176,12 +177,21 @@ class FastScanWorker(QThread):
 
             # Normalize payload fields for UI
             payload = dict(result or {})
+            groups = payload.get("groups") or []
+            stats = payload.get("stats") or {}
             payload.setdefault("scan_root", root)
             payload.setdefault("scan_name", self._cfg.scan_name or f"Scan of {root}")
-            payload.setdefault("groups", payload.get("groups") or [])
-            payload.setdefault("file_count", int(payload.get("file_count", 0) or 0))
+            payload["groups"] = groups
+            payload.setdefault("group_count", len(groups))
+            payload.setdefault("groups_found", len(groups))
+            payload.setdefault(
+                "duplicate_count",
+                sum(max(0, int(g.get("count", len(g.get("paths", [])) or 0)) - 1) for g in groups if isinstance(g, dict)),
+            )
+            payload.setdefault("file_count", int(stats.get("files_scanned", payload.get("file_count", 0)) or 0))
             payload.setdefault("total_size", int(payload.get("total_size", 0) or 0))
             payload.setdefault("scan_duration", float(payload.get("scan_duration", 0.0) or 0.0))
+            payload.setdefault("scanner_tier", self._cfg.scanner_tier)
 
             self.finished.emit(payload)
 
