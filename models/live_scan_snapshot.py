@@ -338,6 +338,19 @@ class LiveScanSnapshot:
             self.is_cancelling = True
             self.current_operation = "Cancelling…"
     
+    def fail_scan(self, error: str = "") -> None:
+        """Mark scan as failed without raising during controller error handling."""
+        self.phase = ScanPhase.FAILED
+        self.is_active = False
+        self.is_paused = False
+        self.is_cancelling = False
+        self.current_file = None
+        self.current_operation = "Failed"
+        if error:
+            self.warnings = [str(error)]
+            self.warnings_count = 1
+        self.throughput.is_measuring = False
+    
     def pause_scan(self) -> None:
         """Pause the scan."""
         if self.is_active and not self.is_paused:
