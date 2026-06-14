@@ -106,13 +106,10 @@ class FastScanWorker(QThread):
 
         try:
             root = str(self._cfg.root)
-            
-            # Check if using optimized scanner tiers
-            if self._cfg.scanner_tier in ("turbo", "ultra", "quantum"):
-                self._run_optimized_scan()
-                return
-            
-            # Fall back to legacy FastPipeline
+
+            # The optimized scanner adapters currently yield file metadata, but
+            # not the grouped duplicate-result contract consumed by Review.
+            # Keep all tiers on FastPipeline until adapters return groups.
             self._pipeline = FastPipeline(
                 max_workers=self._cfg.max_workers,
                 cache_path=self._cfg.cache_path,
@@ -175,13 +172,12 @@ class FastScanWorker(QThread):
                 return
 
             # Normalize payload fields for UI
-            payload = dict(result or {})
-            payload.setdefault("scan_root", root)
-            payload.setdefault("scan_name", self._cfg.scan_name or f"Scan of {root}")
-            payload.setdefault("groups", payload.get("groups") or [])
-            payload.setdefault("file_count", int(payload.get("file_count", 0) or 0))
-            payload.setdefault("total_size", int(payload.get("total_size", 0) or 0))
-            payload.setdefault("scan_duration", float(payload.get("scan_duration", 0.0) or 0.0))
+            payload = self._normalize_result_payload(
+                result,
+                root=root,
+                scan_name=self._cfg.scan_name or f"Scan of {root}",
+                scanner_tier=self._cfg.scanner_tier,
+            )
 
             self.finished.emit(payload)
 
@@ -190,6 +186,70 @@ class FastScanWorker(QThread):
             tb = traceback.format_exc()
             self.error_occurred.emit(msg)
             self.failed.emit(tb)
+
+    @staticmethod
+    def _paths_for_group(group: Any) -> List[str]:
+        if isinstance(group, dict):
+            return [str(p) for p in (group.get("paths") or group.get("files") or group.get("items") or [])]
+        if isinstance(group, (list, tuple)):
+            return [str(p) for p in group]
+        return []
+
+    @classmethod
+    def _normalize_groups(cls, groups: Any) -> List[Any]:
+        if isinstance(groups, dict):
+            normalized = []
+            for key, value in groups.items():
+                if isinstance(value, dict):
+                    item = dict(value)
+                    item.setdefault("hash", key)
+                    normalized.append(item)
+                else:
+                    normalized.append({"hash": key, "paths": [str(p) for p in (value or [])]})
+            return normalized
+        if isinstance(groups, list):
+            return groups
+        if isinstance(groups, tuple):
+            return list(groups)
+        return []
+
+    @classmethod
+    def _duplicate_count_for_groups(cls, groups: List[Any]) -> int:
+        duplicate_count = 0
+        for group in groups:
+            paths = cls._paths_for_group(group)
+            duplicate_count += max(0, len(paths) - 1)
+        return duplicate_count
+
+    @classmethod
+    def _normalize_result_payload(
+        cls,
+        result: Dict[str, Any],
+        *,
+        root: str,
+        scan_name: str,
+        scanner_tier: str,
+    ) -> Dict[str, Any]:
+        payload = dict(result or {})
+        stats = dict(payload.get("stats") or {})
+        groups = cls._normalize_groups(payload.get("groups") or [])
+        group_count = len(groups)
+
+        payload["scan_root"] = str(payload.get("scan_root") or root)
+        payload["scan_name"] = str(payload.get("scan_name") or scan_name)
+        payload["scanner_tier"] = str(payload.get("scanner_tier") or scanner_tier)
+        payload["groups"] = groups
+        payload["group_count"] = int(payload.get("group_count", payload.get("groups_found", group_count)) or group_count)
+        payload["groups_found"] = int(payload.get("groups_found", payload["group_count"]) or payload["group_count"])
+        payload["duplicate_count"] = int(
+            payload.get("duplicate_count", cls._duplicate_count_for_groups(groups)) or cls._duplicate_count_for_groups(groups)
+        )
+        payload["file_count"] = int(payload.get("file_count", stats.get("files_scanned", 0)) or 0)
+        payload["total_size"] = int(payload.get("total_size", stats.get("total_size", 0)) or 0)
+        payload["scan_duration"] = float(
+            payload.get("scan_duration", stats.get("time_seconds", stats.get("elapsed_seconds", 0.0))) or 0.0
+        )
+        return payload
     
     def _run_optimized_scan(self) -> None:
         """Run scan using optimized scanner tiers (Turbo/Ultra/Quantum)."""
