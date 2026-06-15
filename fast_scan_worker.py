@@ -107,8 +107,10 @@ class FastScanWorker(QThread):
         try:
             root = str(self._cfg.root)
             
-            # Check if using optimized scanner tiers
-            if self._cfg.scanner_tier in ("turbo", "ultra", "quantum"):
+            # Ultra/Quantum still use experimental scanner implementations. Turbo is the
+            # default production path, so keep it on FastPipeline until optimized scanners
+            # can emit duplicate groups instead of raw file metadata.
+            if self._cfg.scanner_tier in ("ultra", "quantum"):
                 self._run_optimized_scan()
                 return
             
@@ -176,10 +178,20 @@ class FastScanWorker(QThread):
 
             # Normalize payload fields for UI
             payload = dict(result or {})
+            groups = payload.get("groups") or []
+            group_count = len(groups) if isinstance(groups, list) else int(payload.get("group_count", 0) or 0)
+            duplicate_count = self._count_duplicate_candidates(groups)
+            stats = dict(payload.get("stats") or {})
+
             payload.setdefault("scan_root", root)
             payload.setdefault("scan_name", self._cfg.scan_name or f"Scan of {root}")
-            payload.setdefault("groups", payload.get("groups") or [])
-            payload.setdefault("file_count", int(payload.get("file_count", 0) or 0))
+            payload["groups"] = groups
+            payload.setdefault("scanner_tier", self._cfg.scanner_tier)
+            payload.setdefault("scanner_name", "FastPipeline")
+            payload.setdefault("group_count", group_count)
+            payload.setdefault("groups_found", group_count)
+            payload.setdefault("duplicate_count", duplicate_count)
+            payload.setdefault("file_count", int(payload.get("file_count", stats.get("files_scanned", 0)) or 0))
             payload.setdefault("total_size", int(payload.get("total_size", 0) or 0))
             payload.setdefault("scan_duration", float(payload.get("scan_duration", 0.0) or 0.0))
 
@@ -190,6 +202,23 @@ class FastScanWorker(QThread):
             tb = traceback.format_exc()
             self.error_occurred.emit(msg)
             self.failed.emit(tb)
+
+    @staticmethod
+    def _count_duplicate_candidates(groups: Any) -> int:
+        if not isinstance(groups, list):
+            return 0
+
+        total = 0
+        for group in groups:
+            if isinstance(group, dict):
+                paths = group.get("paths") or group.get("files") or group.get("items") or []
+                try:
+                    total += max(0, len(paths) - 1)
+                except Exception:
+                    continue
+            elif isinstance(group, (list, tuple)):
+                total += max(0, len(group) - 1)
+        return total
     
     def _run_optimized_scan(self) -> None:
         """Run scan using optimized scanner tiers (Turbo/Ultra/Quantum)."""
