@@ -310,13 +310,45 @@ class FastPipeline:
         if cancelled():
             return {"cancelled": True, "ok": False, "stats": {"files_scanned": len(files)}}
 
-        emit(92, "Finalizing results…", {"phase": "finalizing", "files_scanned": len(files)})
+        emit(90, "Verifying duplicate candidates…", {"phase": "verifying", "files_scanned": len(files)})
 
         groups = []
-        for h, paths in hash_groups.items():
-            if len(paths) < 2:
-                continue
-            groups.append({"hash": h, "size": None, "paths": paths, "count": len(paths)})
+        quick_matches = [(h, paths) for h, paths in hash_groups.items() if len(paths) >= 2]
+        total_verify = sum(len(paths) for _, paths in quick_matches)
+        verified = 0
+
+        for quick_hash, paths in quick_matches:
+            if cancelled():
+                return {"cancelled": True, "ok": False, "stats": {"files_scanned": len(files)}}
+
+            full_hash_groups: Dict[str, List[str]] = {}
+            for path in paths:
+                if cancelled():
+                    return {"cancelled": True, "ok": False, "stats": {"files_scanned": len(files)}}
+
+                full_hash = self._full_hash(path)
+                verified += 1
+                if full_hash:
+                    full_hash_groups.setdefault(full_hash, []).append(path)
+
+                if progress_cb and (verified % 128 == 0 or verified == total_verify):
+                    pct = 90 + int(9 * (verified / max(1, total_verify)))
+                    emit(
+                        pct,
+                        f"Verifying duplicates… {verified:,}/{total_verify:,}",
+                        {"phase": "verifying", "files_scanned": len(files)},
+                    )
+
+            for full_hash, full_paths in full_hash_groups.items():
+                if len(full_paths) < 2:
+                    continue
+                groups.append({
+                    "hash": full_hash,
+                    "quick_hash": quick_hash,
+                    "size": self._safe_size(full_paths[0]),
+                    "paths": full_paths,
+                    "count": len(full_paths),
+                })
 
         elapsed = time.time() - start
         emit(100, f"FAST MODE done: {len(groups)} duplicate groups", {
@@ -367,6 +399,27 @@ class FastPipeline:
             return f, h.hexdigest()
         except Exception:
             return f, None
+
+    @staticmethod
+    def _full_hash(path: str) -> Optional[str]:
+        try:
+            h = hashlib.sha256()
+            with open(path, "rb", buffering=0) as fp:
+                while True:
+                    chunk = fp.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    h.update(chunk)
+            return h.hexdigest()
+        except Exception:
+            return None
+
+    @staticmethod
+    def _safe_size(path: str) -> Optional[int]:
+        try:
+            return int(os.path.getsize(path))
+        except Exception:
+            return None
 
 
 __all__ = ["FastPipeline", "FastFileInfo"]
