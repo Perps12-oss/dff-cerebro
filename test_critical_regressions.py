@@ -167,7 +167,13 @@ def _install_review_page_dependency_stubs() -> None:
     base_station.BaseStation = _QtObject
     sys.modules["cerebro.ui.pages.base_station"] = base_station
 
+    class _StateBus:
+        @staticmethod
+        def allowed_extensions_for_media_type(media_type: str):
+            return None
+
     state_bus = types.ModuleType("cerebro.ui.state_bus")
+    state_bus.StateBus = _StateBus
     state_bus.get_state_bus = lambda: types.SimpleNamespace(notify=lambda *args, **kwargs: None)
     sys.modules["cerebro.ui.state_bus"] = state_bus
 
