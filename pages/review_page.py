@@ -4,7 +4,7 @@ CEREBRO v5.0 — Review Page (PySide6) — POLISHED MERGED DESIGN
 
 Enhanced with:
 ✓ Smart logic applies to ALL groups (filtered or all)
-✓ Media type filtering actually filters displayed groups  
+✓ Media type filtering actually filters displayed groups
 ✓ Smart select respects current filter context
 ✓ Always-visible floating Delete button (prominent, responsive)
 ✓ Full keyboard navigation (arrows, space, delete, 1-5)
@@ -305,7 +305,7 @@ class CleanupProgressDialog(QDialog):
                 font-weight: bold;
             }
             QProgressBar::chunk {
-                background: qlineargradient(x1:0, y1:0, x2:1, y2:0, 
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
                     stop:0 #22c55e, stop:0.5 #3b82f6, stop:1 #8b5cf6);
                 border-radius: 13px;
             }
@@ -479,11 +479,56 @@ def extract_group_data(group: Any, idx: int = 0) -> GroupData:
         hint = str(group.get("reason") or group.get("hint") or group.get("description") or "")
         recoverable = int(group.get("recoverable_bytes", group.get("recoverable", 0)) or 0)
         similarity = float(group.get("similarity", 100.0) or 100.0)
-        return GroupData(paths=paths, hint=hint, recoverable_bytes=recoverable, 
+        return GroupData(paths=paths, hint=hint, recoverable_bytes=recoverable,
                         similarity=similarity, group_id=idx)
     if isinstance(group, (list, tuple)):
         return GroupData(paths=[str(p) for p in group], group_id=idx)
     return GroupData(paths=[], group_id=idx)
+
+
+def build_deletion_plan_from_groups(
+    groups: List[GroupData],
+    keep_states: Dict[int, Dict[str, bool]],
+    *,
+    scan_id: str = "",
+    mode: str = "trash",
+    source: str = "review_page",
+) -> Dict[str, Any]:
+    delete_groups: List[Dict[str, Any]] = []
+    total_delete_size = 0
+
+    for g in groups:
+        keep_map = keep_states.get(g.group_id, {})
+        delete_paths = [p for p in g.paths if not keep_map.get(p, True)]
+        if not delete_paths:
+            continue
+
+        keep_paths = [p for p in g.paths if keep_map.get(p, True)]
+        if not keep_paths:
+            raise ValueError(f"Group {g.group_id + 1} must keep at least one file.")
+
+        group_size = sum(os.path.getsize(p) for p in delete_paths if os.path.exists(p))
+        total_delete_size += group_size
+        delete_groups.append({
+            "group_index": int(g.group_id),
+            "keep": keep_paths[0],
+            "delete": delete_paths,
+            "hint": g.hint,
+            "recoverable_bytes": group_size,
+        })
+
+    stats = {
+        "group_count": len(delete_groups),
+        "file_count": sum(len(g["delete"]) for g in delete_groups),
+        "recoverable_bytes": total_delete_size,
+    }
+    return {
+        "scan_id": str(scan_id or ""),
+        "policy": {"mode": str(mode or "trash")},
+        "source": str(source or "review_page"),
+        "groups": delete_groups,
+        "stats": stats,
+    }
 
 
 # ==============================================================================
@@ -1067,7 +1112,7 @@ class ReviewPage(BaseStation):
             self._filtered_groups = list(self._all_groups)
         else:
             self._filtered_groups = [
-                g for g in self._all_groups 
+                g for g in self._all_groups
                 if g.get_category() == self._current_filter
             ]
 
@@ -1371,21 +1416,19 @@ class ReviewPage(BaseStation):
         self._open_ceremony()
 
     def _open_ceremony(self):
-        delete_groups = []
-        total_delete_size = 0
+        try:
+            cleanup_data = build_deletion_plan_from_groups(
+                self._filtered_groups,
+                self._keep_states,
+                scan_id=str(self._result.get("scan_id") or ""),
+            )
+        except ValueError as e:
+            QMessageBox.warning(self, "Invalid Selection", str(e))
+            return
 
-        for g in self._filtered_groups:
-            keep_map = self._keep_states.get(g.group_id, {})
-            delete_paths = [p for p in g.paths if not keep_map.get(p, True)]
-
-            if delete_paths:
-                group_size = sum(os.path.getsize(p) for p in delete_paths if os.path.exists(p))
-                total_delete_size += group_size
-                delete_groups.append({
-                    "paths": delete_paths,
-                    "hint": g.hint,
-                    "recoverable_bytes": group_size,
-                })
+        delete_groups = cleanup_data["groups"]
+        stats = cleanup_data["stats"]
+        total_delete_size = int(stats.get("recoverable_bytes", 0) or 0)
 
         if not delete_groups:
             QMessageBox.information(
@@ -1396,7 +1439,7 @@ class ReviewPage(BaseStation):
             )
             return
 
-        total_files = sum(len(g["paths"]) for g in delete_groups)
+        total_files = int(stats.get("file_count", 0) or 0)
 
         reply = QMessageBox.question(
             self,
@@ -1414,13 +1457,6 @@ class ReviewPage(BaseStation):
         self._progress_dialog.cancelled.connect(self._on_cleanup_cancelled)
         self._progress_dialog.show()
 
-        stats = {
-            "group_count": len(delete_groups),
-            "file_count": total_files,
-            "recoverable_bytes": total_delete_size,
-        }
-
-        cleanup_data = {"groups": delete_groups, "stats": stats}
         self.cleanup_confirmed.emit(cleanup_data)
 
     def _on_cleanup_cancelled(self):

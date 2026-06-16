@@ -41,24 +41,139 @@ class _QObject:
         super().__init__()
 
 
+class _QtObject:
+    def __init__(self, *args, **kwargs) -> None:
+        pass
+
+    def __getattr__(self, name):
+        return _QtObject()
+
+    def __call__(self, *args, **kwargs):
+        return _QtObject()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return False
+
+
 class _QThread(_QObject):
     def start(self) -> None:
         self.run()
 
 
+class _QTimer(_QObject):
+    timeout = _Signal()
+
+    def setInterval(self, value) -> None:
+        pass
+
+    def start(self) -> None:
+        pass
+
+    def stop(self) -> None:
+        pass
+
+
+class _QThreadPool(_QtObject):
+    @staticmethod
+    def globalInstance():
+        return _QThreadPool()
+
+
 def _install_pyside_stubs() -> None:
-    if "PySide6" in sys.modules:
-        return
-    pyside = types.ModuleType("PySide6")
-    qtcore = types.ModuleType("PySide6.QtCore")
+    pyside = sys.modules.setdefault("PySide6", types.ModuleType("PySide6"))
+    qtcore = sys.modules.setdefault("PySide6.QtCore", types.ModuleType("PySide6.QtCore"))
     qtcore.QObject = _QObject
     qtcore.QThread = _QThread
     qtcore.Signal = _Signal
     qtcore.Slot = lambda *args, **kwargs: (lambda func: func)
-    qtcore.QTimer = type("QTimer", (_QObject,), {"setInterval": lambda self, value: None, "start": lambda self: None, "stop": lambda self: None, "timeout": _Signal()})
-    qtcore.Qt = types.SimpleNamespace()
-    sys.modules["PySide6"] = pyside
-    sys.modules["PySide6.QtCore"] = qtcore
+    qtcore.QTimer = _QTimer
+    qtcore.QRunnable = _QtObject
+    qtcore.QThreadPool = _QThreadPool
+    qtcore.QMutex = _QtObject
+    qtcore.QMutexLocker = _QtObject
+    qtcore.QPropertyAnimation = _QtObject
+    qtcore.QItemSelectionModel = _QtObject
+    qtcore.Qt = types.SimpleNamespace(
+        Checked=2,
+        Unchecked=0,
+        AlignRight=1,
+        AlignVCenter=2,
+        AlignCenter=4,
+        KeepAspectRatio=1,
+        SmoothTransformation=1,
+        ItemIsUserCheckable=1,
+        CursorShape=types.SimpleNamespace(PointingHandCursor=1),
+    )
+    for name in ("QSize", "QRect", "QPoint", "QEvent", "QEasingCurve"):
+        setattr(qtcore, name, _QtObject)
+
+    qtgui = sys.modules.setdefault("PySide6.QtGui", types.ModuleType("PySide6.QtGui"))
+    for name in (
+        "QPixmap",
+        "QKeySequence",
+        "QShortcut",
+        "QKeyEvent",
+        "QFontMetrics",
+        "QColor",
+        "QPainter",
+        "QFont",
+    ):
+        setattr(qtgui, name, _QtObject)
+
+    qtwidgets = sys.modules.setdefault("PySide6.QtWidgets", types.ModuleType("PySide6.QtWidgets"))
+    for name in (
+        "QWidget",
+        "QVBoxLayout",
+        "QHBoxLayout",
+        "QGridLayout",
+        "QLayout",
+        "QLabel",
+        "QPushButton",
+        "QFrame",
+        "QScrollArea",
+        "QSplitter",
+        "QComboBox",
+        "QCheckBox",
+        "QDialog",
+        "QListWidget",
+        "QListWidgetItem",
+        "QStackedWidget",
+        "QSizePolicy",
+        "QTableWidget",
+        "QTableWidgetItem",
+        "QHeaderView",
+        "QAbstractItemView",
+        "QInputDialog",
+        "QProgressBar",
+        "QTextEdit",
+        "QGroupBox",
+        "QToolButton",
+        "QGraphicsDropShadowEffect",
+        "QApplication",
+    ):
+        setattr(qtwidgets, name, _QtObject)
+    qtwidgets.QMessageBox = types.SimpleNamespace(Yes=1, No=2, warning=lambda *args, **kwargs: None)
+
+    pyside.QtCore = qtcore
+    pyside.QtGui = qtgui
+    pyside.QtWidgets = qtwidgets
+
+
+def _install_review_page_dependency_stubs() -> None:
+    base_station = types.ModuleType("cerebro.ui.pages.base_station")
+    base_station.BaseStation = _QtObject
+    sys.modules["cerebro.ui.pages.base_station"] = base_station
+
+    state_bus = types.ModuleType("cerebro.ui.state_bus")
+    state_bus.get_state_bus = lambda: types.SimpleNamespace(notify=lambda *args, **kwargs: None)
+    sys.modules["cerebro.ui.state_bus"] = state_bus
+
+    theme_engine = types.ModuleType("cerebro.ui.theme_engine")
+    theme_engine.get_theme_manager = lambda: None
+    sys.modules["cerebro.ui.theme_engine"] = theme_engine
 
 
 class CriticalRegressionTests(unittest.TestCase):
@@ -113,6 +228,38 @@ class CriticalRegressionTests(unittest.TestCase):
             self.assertEqual(len(groups), 1)
             self.assertCountEqual([Path(p).name for p in groups[0]["paths"]], ["a.bin", "b.bin"])
             self.assertEqual(finished[0].get("group_count"), 1)
+
+    def test_review_cleanup_payload_uses_deletion_plan_contract(self) -> None:
+        _install_review_page_dependency_stubs()
+        from cerebro.ui.pages.review_page import GroupData, build_deletion_plan_from_groups
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            keep = root / "keep.bin"
+            delete = root / "delete.bin"
+            keep.write_bytes(b"keep")
+            delete.write_bytes(b"delete-me")
+
+            group = GroupData(paths=[str(keep), str(delete)], hint="same hash", group_id=7)
+            plan = build_deletion_plan_from_groups(
+                [group],
+                {7: {str(keep): True, str(delete): False}},
+                scan_id="scan-123",
+            )
+
+        self.assertEqual(plan["scan_id"], "scan-123")
+        self.assertEqual(plan["policy"], {"mode": "trash"})
+        self.assertEqual(plan["source"], "review_page")
+        self.assertEqual(plan["stats"]["group_count"], 1)
+        self.assertEqual(plan["stats"]["file_count"], 1)
+        self.assertEqual(plan["groups"], [{
+            "group_index": 7,
+            "keep": str(keep),
+            "delete": [str(delete)],
+            "hint": "same hash",
+            "recoverable_bytes": len(b"delete-me"),
+        }])
+        self.assertNotIn("paths", plan["groups"][0])
 
 
 if __name__ == "__main__":
