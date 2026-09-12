@@ -17,7 +17,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List
 
-from cerebro.core.pipeline import PipelineRequest
+from cerebro.core.pipeline import CancelToken, PipelineRequest
 
 
 # ---------------------------------------------------------------------
@@ -106,7 +106,7 @@ class HashClustering:
         """
         Generates a stable, human-debuggable group ID.
         """
-        h = hashlib.sha1()
+        h = hashlib.sha1(usedforsecurity=False)
         h.update(digest.encode("utf-8"))
         for p in paths[:3]:  # sample a few paths for entropy
             h.update(str(p).encode("utf-8"))
