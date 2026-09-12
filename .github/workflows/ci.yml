@@ -44,7 +44,7 @@ jobs:
         run: bandit --severity-level high deletion_gate.py models.py grouping.py clustering.py scoring.py file_utils.py
 
       - name: Pytest
-        run: python -m pytest -q --cov-report=xml --cov=deletion_gate --cov=models
+        run: python -m pytest -q tests --cov-report=xml --cov=deletion_gate --cov=models --import-mode=importlib
 
       - name: Upload coverage
         if: always()
